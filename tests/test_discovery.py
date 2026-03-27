@@ -61,7 +61,7 @@ class TestPassesFilters:
             "ticker": "TEST", "title": "Test", "yes_bid": 40, "yes_ask": 45,
             "no_bid": 55, "no_ask": 60, "last_price": 42, "volume": 1000,
             "volume_24h": 200, "open_interest": 500,
-            "close_time": "2027-01-01T00:00:00Z",
+            "close_time": "2026-05-01T00:00:00Z",  # ~30 days out
         }
         defaults.update(kwargs)
         return Market(**defaults)

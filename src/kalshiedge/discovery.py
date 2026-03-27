@@ -14,6 +14,7 @@ logger = structlog.get_logger()
 
 MIN_VOLUME = 50
 MIN_HOURS_TO_EXPIRY = 2
+MAX_DAYS_TO_EXPIRY = 90  # Don't trade markets expiring more than 90 days out
 PAGE_DELAY = 2.5  # seconds between API calls to avoid rate limits
 
 # Categories where LLMs have strongest forecasting edge
@@ -166,7 +167,7 @@ def _passes_filters(market: Market) -> bool:
     if market.volume < MIN_VOLUME:
         return False
 
-    # Must have time remaining
+    # Must have time remaining — but not too much
     if market.close_time:
         try:
             close = datetime.datetime.fromisoformat(
@@ -175,6 +176,8 @@ def _passes_filters(market: Market) -> bool:
             now = datetime.datetime.now(datetime.timezone.utc)
             hours_left = (close - now).total_seconds() / 3600
             if hours_left < MIN_HOURS_TO_EXPIRY:
+                return False
+            if hours_left > MAX_DAYS_TO_EXPIRY * 24:
                 return False
         except ValueError:
             pass
