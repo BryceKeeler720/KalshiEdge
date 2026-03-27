@@ -16,6 +16,21 @@ def compute_edge(p_model: float, price_cents: int) -> tuple[str, float]:
     return "none", 0.0
 
 
+def r_score(p_model: float, price_cents: int) -> float:
+    """Z-score edge metric: how many std devs the market is from fair value.
+
+    R = (p_model - p_market) / sqrt(p_model * (1 - p_model))
+    Higher = stronger signal. Trade when |R| > 1.5.
+    """
+    p_market = price_cents / 100
+    if p_model <= 0.01 or p_model >= 0.99:
+        return 0.0
+    std = math.sqrt(p_model * (1 - p_model))
+    if std == 0:
+        return 0.0
+    return (p_model - p_market) / std
+
+
 def estimated_taker_fee_cents(price_cents: int) -> float:
     """Approximate taker fee per contract in cents.
 

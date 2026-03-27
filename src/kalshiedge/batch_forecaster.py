@@ -45,13 +45,10 @@ class BatchForecaster:
 
         for market in markets:
             news_context = format_news_context(market["news_items"])
-            price_pct = market["price_cents"] / 100
             current_date = datetime.date.today().isoformat()
 
             user_prompt = FORECAST_USER.format(
                 title=market["title"],
-                price_cents=market["price_cents"],
-                price_pct=price_pct,
                 close_time=market["close_time"],
                 current_date=current_date,
                 news_context=news_context,

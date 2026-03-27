@@ -17,9 +17,10 @@ from kalshiedge.alerts import AlertManager
 from kalshiedge.batch_forecaster import BatchForecaster
 from kalshiedge.calendar import boost_event_markets, get_upcoming_events
 from kalshiedge.config import settings
+from kalshiedge.debate import debate_forecast
 from kalshiedge.discovery import Market, check_orderbook_depth, discover_markets
-from kalshiedge.edge import compute_edge, net_edge, quarter_kelly
-from kalshiedge.forecaster import forecast_market, screen_market
+from kalshiedge.edge import compute_edge, net_edge, quarter_kelly, r_score
+from kalshiedge.forecaster import screen_market
 from kalshiedge.kalshi_client import KalshiClient
 from kalshiedge.momentum import run_momentum_scan
 from kalshiedge.portfolio import PortfolioStore
@@ -35,6 +36,7 @@ from kalshiedge.strategies import (
     find_event_driven_markets,
     run_intra_event_arbitrage,
     run_near_expiry_convergence,
+    run_safe_compounder,
 )
 from kalshiedge.trader import monitor_fill, place_limit_order
 from kalshiedge.websocket import KalshiWebSocket
@@ -92,6 +94,12 @@ async def run_fast_cycle(
         await run_momentum_scan(kalshi, store, risk)
     except Exception:
         logger.exception("momentum_strategy_failed")
+
+    # Strategy 6: Safe Compounder — NO-side on near-certain outcomes (no Claude calls)
+    try:
+        await run_safe_compounder(kalshi, store, risk)
+    except Exception:
+        logger.exception("compounder_strategy_failed")
 
     logger.info("fast_cycle_complete")
 
@@ -297,7 +305,8 @@ async def _process_market(
 
     news = await gather_news(market.title)
 
-    result = await forecast_market(
+    # Use debate protocol (2 Haiku + 1 Sonnet) instead of 3x Sonnet
+    result = await debate_forecast(
         client=claude,
         title=market.title,
         price_cents=market.last_price,
@@ -309,6 +318,12 @@ async def _process_market(
 
     side, edge = compute_edge(result.probability, market.last_price)
     effective_edge = net_edge(result.probability, market.last_price)
+
+    # R-score filter: only trade when statistically significant
+    rscore = r_score(result.probability, market.last_price)
+    if abs(rscore) < 1.0:
+        logger.debug("rscore_too_low", ticker=market.ticker, rscore=f"{rscore:.2f}")
+        return
 
     await store.record_forecast(
         ticker=market.ticker,

@@ -91,13 +91,11 @@ async def forecast_market(
 ) -> ForecastResult | None:
     """Full Sonnet ensemble — 3 calls at different temperatures."""
     news_context = format_news_context(news_items)
-    price_pct = price_cents / 100
     current_date = datetime.date.today().isoformat()
 
+    # Anti-anchoring: don't show market price to the model
     user_prompt = FORECAST_USER.format(
         title=title,
-        price_cents=price_cents,
-        price_pct=price_pct,
         close_time=close_time,
         current_date=current_date,
         news_context=news_context,

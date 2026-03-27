@@ -135,6 +135,124 @@ async def _convergence_trade(
 
 
 # ---------------------------------------------------------------------------
+# Strategy 6: Safe Compounder
+# NO-side maker orders on near-certain outcomes. Estimates true NO probability
+# mathematically from YES price + time to expiry. Zero LLM cost.
+# ---------------------------------------------------------------------------
+
+SAFE_MAX_YES_PRICE = 7  # Only compound when YES is 1-7c (NO is 93-99c)
+SAFE_MIN_HOURS = 2  # Need at least 2 hours to expiry
+SAFE_MAX_DAYS = 30  # Only short-dated markets
+
+
+def estimate_true_no_prob(yes_price_cents: int, hours_to_expiry: float) -> float:
+    """Estimate true NO probability from YES price and time remaining.
+
+    Low YES price + short time = very high NO probability.
+    """
+    if yes_price_cents <= 0 or hours_to_expiry <= 0:
+        return 0.0
+    p_yes = yes_price_cents / 100
+    # Time decay: as expiry approaches, low-priced YES becomes less likely
+    time_factor = min(1.0, hours_to_expiry / (24 * 7))  # normalize to 1 week
+    # Higher YES price = less certain NO outcome
+    certainty = (1 - p_yes) * (1 - time_factor * 0.3)
+    return min(0.99, max(0.0, certainty))
+
+
+@observe(span_type=SpanType.CHAIN)
+async def run_safe_compounder(
+    kalshi: KalshiClient,
+    store: PortfolioStore,
+    risk: RiskManager,
+) -> int:
+    """Find near-certain NO outcomes and place maker orders. Returns trade count."""
+    trades = 0
+    now = datetime.datetime.now(datetime.timezone.utc)
+
+    try:
+        data = await kalshi.get_markets(limit=100)
+        raw_markets = data.get("markets", [])
+    except Exception:
+        logger.warning("compounder_market_fetch_failed")
+        return 0
+
+    open_trades = await store.get_open_positions()
+    open_tickers = {t["ticker"] for t in open_trades}
+
+    for m in raw_markets:
+        ticker = m.get("ticker", "")
+        if ticker.startswith("KXMVE") or ticker in open_tickers:
+            continue
+
+        close_str = m.get("close_time", "")
+        if not close_str:
+            continue
+
+        try:
+            close = datetime.datetime.fromisoformat(close_str.replace("Z", "+00:00"))
+            hours_left = (close - now).total_seconds() / 3600
+        except ValueError:
+            continue
+
+        if hours_left < SAFE_MIN_HOURS or hours_left > SAFE_MAX_DAYS * 24:
+            continue
+
+        yes_price = _dollars_to_cents(
+            m.get("yes_bid_dollars") or m.get("last_price_dollars")
+        )
+
+        if yes_price < 1 or yes_price > SAFE_MAX_YES_PRICE:
+            continue
+
+        # Estimate how certain the NO outcome is
+        true_no_prob = estimate_true_no_prob(yes_price, hours_left)
+        if true_no_prob < 0.95:
+            continue
+
+        # Place NO maker order at 1c below the ask for fee-free fill
+        no_price = 100 - yes_price  # Our NO buy price
+        edge = true_no_prob - (no_price / 100)
+        if edge < 0.02:
+            continue
+
+        bankroll = await store.get_bankroll_cents() or settings.bankroll_cents
+        max_cost = int(bankroll * settings.max_position_pct * 0.5)  # Half size
+        count = max_cost // no_price
+        if count <= 0:
+            continue
+
+        trade = ProposedTrade(
+            ticker=ticker, side="no", action="buy",
+            price_cents=no_price, count=count, edge=edge,
+        )
+        if not await risk.can_trade(trade):
+            continue
+
+        if settings.dry_run:
+            logger.info(
+                "dry_run_compounder",
+                ticker=ticker, count=count, no_price=no_price,
+                true_no_prob=f"{true_no_prob:.1%}", hours_left=f"{hours_left:.0f}h",
+            )
+            continue
+
+        order = await place_limit_order(kalshi, ticker, "no", count, no_price)
+        if order:
+            await store.record_trade(
+                ticker=ticker, side="no", action="buy",
+                price_cents=no_price, count=count,
+                order_id=order.get("order_id", ""),
+                strategy="safe_compounder",
+            )
+            trades += 1
+
+    if trades:
+        logger.info("compounder_complete", trades=trades)
+    return trades
+
+
+# ---------------------------------------------------------------------------
 # Strategy 3: Event-Driven Positioning
 # Look for markets tied to upcoming scheduled events (Fed, CPI, earnings)
 # and position when model has strong conviction before the event.

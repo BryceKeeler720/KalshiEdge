@@ -122,10 +122,16 @@ async def discover_markets(client: KalshiClient) -> list[Market]:
 
 
 def _parse_market(raw: dict, category: str = "") -> Market | None:
+    # Sports/entertainment prefixes — LLMs are terrible at these
+    skip_prefixes = (
+        "KXMVE", "KXNBA", "KXNFL", "KXNHL", "KXMLB", "KXSOCCER",
+        "KXMMA", "KXUFC", "KXBOXING", "KXTENNIS", "KXGOLF",
+        "KXCOLLEGE", "KXNCAA", "KXWWE", "KXESPORTS", "KXMARCH",
+        "KXNASCAR", "KXF1RACE", "KXPGA",
+    )
     try:
-        # Skip multi-leg combo markets
         ticker = raw["ticker"]
-        if ticker.startswith("KXMVE"):
+        if any(ticker.startswith(p) for p in skip_prefixes):
             return None
 
         yes_bid = _dollars_to_cents(raw.get("yes_bid_dollars") or raw.get("yes_bid"))
