@@ -173,14 +173,15 @@ async def run_slow_cycle(
         seen_tickers.add(m.ticker)
         prioritized.append(m)
 
-    cap = settings.max_forecasts_per_cycle
-    selected = prioritized[:cap]
+    # Stage 1: Pass all filtered markets to Haiku screen (cheap)
+    screen_cap = settings.max_screens_per_cycle
+    selected = prioritized[:screen_cap]
 
     # Skip tickers we already have open trades on
     open_trades = await store.get_open_positions()
     open_tickers = {t["ticker"] for t in open_trades}
     selected = [m for m in selected if m.ticker not in open_tickers]
-    logger.info("markets_selected", count=len(selected), cap=cap)
+    logger.info("markets_to_screen", count=len(selected))
 
     if not selected:
         logger.info("slow_cycle_complete", markets_processed=0)
@@ -191,7 +192,7 @@ async def run_slow_cycle(
         await ws.subscribe_tickers([m.ticker for m in selected])
 
     # Gather news + cheap Haiku screen on ALL selected markets
-    screened: list[tuple[Market, list, str]] = []
+    screened: list[tuple[Market, list, str, float]] = []  # (market, news, strategy, edge)
     for market in selected:
         news = await gather_news(market.title)
 
@@ -209,7 +210,7 @@ async def run_slow_cycle(
                     if market.ticker in {m.ticker for m in event_markets}
                     else "calibration_edge"
                 )
-                screened.append((market, news, strategy))
+                screened.append((market, news, strategy, raw_edge))
                 logger.info(
                     "screen_passed",
                     ticker=market.ticker,
@@ -227,8 +228,18 @@ async def run_slow_cycle(
         passed=len(screened),
     )
 
-    # Submit batch forecast only for screened markets (50% cheaper)
-    if batch and not batch.has_pending_batch and screened:
+    # Stage 2: Sort screened by edge size, cap for Sonnet
+    screened.sort(key=lambda x: x[3], reverse=True)  # sort by edge
+    sonnet_cap = settings.max_sonnet_per_cycle
+    sonnet_markets = screened[:sonnet_cap]
+    logger.info(
+        "sonnet_candidates",
+        screened=len(screened),
+        forecasting=len(sonnet_markets),
+    )
+
+    # Submit batch forecast for next cycle (50% cheaper)
+    if batch and not batch.has_pending_batch and sonnet_markets:
         try:
             batch.submit_batch([
                 {
@@ -238,13 +249,13 @@ async def run_slow_cycle(
                     "close_time": m.close_time,
                     "news_items": news,
                 }
-                for m, news, _ in screened
+                for m, news, _, _ in sonnet_markets
             ])
         except Exception:
             logger.exception("batch_submit_failed")
 
-    # Run full Sonnet ensemble only on screened markets
-    for market, _news, strategy in screened:
+    # Stage 3: Run full Sonnet ensemble on top candidates
+    for market, _news, strategy, _edge in sonnet_markets:
         try:
             await _process_market(
                 kalshi, claude, store, risk, alerts, market, strategy=strategy
