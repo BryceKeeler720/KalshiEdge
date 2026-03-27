@@ -126,14 +126,29 @@ async def run_slow_cycle(
     # Prioritize event-driven markets (Strategy 3)
     event_markets = await find_event_driven_markets(markets)
 
-    # Combine: event-driven first, then top by volume, deduplicated
+    # Score markets: prefer high volume + shorter expiry (faster capital turnover)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for m in markets:
+        days_to_expiry = 365.0  # default for missing close_time
+        if m.close_time:
+            try:
+                close = datetime.datetime.fromisoformat(
+                    m.close_time.replace("Z", "+00:00")
+                )
+                days_to_expiry = max((close - now).total_seconds() / 86400, 0.1)
+            except ValueError:
+                pass
+        # Score: volume / sqrt(days) — rewards high volume + short duration
+        m._score = m.volume / (days_to_expiry ** 0.5)  # type: ignore[attr-defined]
+
+    # Combine: event-driven first, then scored, deduplicated
+    markets.sort(key=lambda m: getattr(m, "_score", 0), reverse=True)
     seen_tickers: set[str] = set()
     prioritized: list[Market] = []
     for m in event_markets:
         if m.ticker not in seen_tickers:
             seen_tickers.add(m.ticker)
             prioritized.append(m)
-    markets.sort(key=lambda m: m.volume, reverse=True)
     for m in markets:
         if m.ticker not in seen_tickers:
             seen_tickers.add(m.ticker)

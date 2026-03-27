@@ -14,6 +14,10 @@ logger = structlog.get_logger()
 # Exit when edge has flipped or shrunk below this threshold
 EXIT_EDGE_THRESHOLD = 0.03
 
+# Stop-loss / take-profit thresholds (based on unrealized P&L %)
+STOP_LOSS_PCT = -0.15   # Exit at 15% loss
+TAKE_PROFIT_PCT = 0.30  # Exit at 30% gain
+
 
 @observe(span_type=SpanType.RETRIEVAL)
 async def sync_positions(kalshi: KalshiClient, store: PortfolioStore) -> list[dict]:
@@ -115,15 +119,39 @@ async def evaluate_exits(
             should_exit = False
             exit_reason = ""
 
-            if holding_side == "yes" and side != "yes":
-                should_exit = True
-                exit_reason = "edge_flipped_to_no"
-            elif holding_side == "no" and side != "no" and side != "none":
-                should_exit = True
-                exit_reason = "edge_flipped_to_yes"
-            elif abs(eff_edge) < EXIT_EDGE_THRESHOLD:
-                should_exit = True
-                exit_reason = "edge_evaporated"
+            # Check stop-loss / take-profit
+            entry = await store.execute_fetchall(
+                "SELECT price_cents FROM trades "
+                "WHERE ticker = ? AND action = 'buy' AND side = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (ticker, holding_side),
+            )
+            if entry:
+                entry_price = entry[0][0]
+                if holding_side == "yes":
+                    current_value = last_price
+                else:
+                    current_value = 100 - last_price
+                if entry_price > 0:
+                    unrealized_pct = (current_value - entry_price) / entry_price
+                    if unrealized_pct <= STOP_LOSS_PCT:
+                        should_exit = True
+                        exit_reason = f"stop_loss_{unrealized_pct:+.0%}"
+                    elif unrealized_pct >= TAKE_PROFIT_PCT:
+                        should_exit = True
+                        exit_reason = f"take_profit_{unrealized_pct:+.0%}"
+
+            # Check edge-based exits
+            if not should_exit:
+                if holding_side == "yes" and side != "yes":
+                    should_exit = True
+                    exit_reason = "edge_flipped_to_no"
+                elif holding_side == "no" and side != "no" and side != "none":
+                    should_exit = True
+                    exit_reason = "edge_flipped_to_yes"
+                elif abs(eff_edge) < EXIT_EDGE_THRESHOLD:
+                    should_exit = True
+                    exit_reason = "edge_evaporated"
 
             if should_exit:
                 exits.append({
