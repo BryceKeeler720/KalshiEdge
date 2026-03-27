@@ -23,6 +23,11 @@ from kalshiedge.positions import (
 )
 from kalshiedge.research import gather_news
 from kalshiedge.risk import ProposedTrade, RiskManager
+from kalshiedge.strategies import (
+    find_event_driven_markets,
+    run_intra_event_arbitrage,
+    run_near_expiry_convergence,
+)
 from kalshiedge.trader import monitor_fill, place_limit_order
 
 logger = structlog.get_logger()
@@ -50,28 +55,59 @@ async def run_cycle(
     except Exception:
         logger.exception("position_management_failed")
 
-    # Discover and forecast new opportunities
+    # Strategy 2: Near-Expiry Convergence (no Claude calls needed)
+    try:
+        await run_near_expiry_convergence(kalshi, store, risk)
+    except Exception:
+        logger.exception("convergence_strategy_failed")
+
+    # Strategy 4: Intra-Event Arbitrage (no Claude calls needed)
+    try:
+        await run_intra_event_arbitrage(kalshi, store, risk)
+    except Exception:
+        logger.exception("arbitrage_strategy_failed")
+
+    # Discover markets for Strategy 1 (Calibration Edge) + Strategy 3 (Event-Driven)
     markets = await discover_markets(kalshi)
     if not markets:
         logger.info("no_markets_found")
         return
 
-    # Sort by volume descending, cap to control API costs
-    markets.sort(key=lambda m: m.volume, reverse=True)
-    cap = settings.max_forecasts_per_cycle
-    markets = markets[:cap]
-    logger.info("markets_selected", count=len(markets), cap=cap)
+    # Strategy 3: Prioritize event-driven markets
+    event_markets = await find_event_driven_markets(markets)
 
-    for market in markets:
+    # Combine: event-driven first, then top by volume, deduplicated
+    seen_tickers: set[str] = set()
+    prioritized: list[Market] = []
+    for m in event_markets:
+        if m.ticker not in seen_tickers:
+            seen_tickers.add(m.ticker)
+            prioritized.append(m)
+    markets.sort(key=lambda m: m.volume, reverse=True)
+    for m in markets:
+        if m.ticker not in seen_tickers:
+            seen_tickers.add(m.ticker)
+            prioritized.append(m)
+
+    cap = settings.max_forecasts_per_cycle
+    selected = prioritized[:cap]
+    logger.info("markets_selected", count=len(selected), cap=cap)
+
+    for market in selected:
+        strategy = "event_driven" if market.ticker in {
+            m.ticker for m in event_markets
+        } else "calibration_edge"
         try:
-            await _process_market(kalshi, claude, store, risk, alerts, market)
+            await _process_market(
+                kalshi, claude, store, risk, alerts, market, strategy=strategy
+            )
         except Exception:
             logger.exception("market_processing_failed", ticker=market.ticker)
             await alerts.notify_error(
                 f"Failed processing {market.ticker}", context="run_cycle"
             )
 
-    logger.info("cycle_complete", markets_processed=len(markets))
+    logger.info("cycle_complete", markets_processed=len(selected))
 
 
 async def _process_market(
@@ -81,6 +117,7 @@ async def _process_market(
     risk: RiskManager,
     alerts: AlertManager,
     market: Market,
+    strategy: str = "calibration_edge",
 ) -> None:
     has_depth = await check_orderbook_depth(kalshi, market.ticker)
     if not has_depth:
@@ -111,6 +148,7 @@ async def _process_market(
         confidence_low=result.confidence_low,
         confidence_high=result.confidence_high,
         reasoning=result.reasoning,
+        strategy=strategy,
     )
 
     if side == "none" or effective_edge < settings.min_edge_threshold:
@@ -175,6 +213,7 @@ async def _process_market(
         price_cents=price,
         count=count,
         order_id=order_id,
+        strategy=strategy,
     )
     await alerts.notify_trade(
         ticker=market.ticker,

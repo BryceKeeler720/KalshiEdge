@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS trades (
     count INTEGER NOT NULL,
     order_id TEXT,
     status TEXT DEFAULT 'pending',
+    strategy TEXT DEFAULT 'calibration_edge',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     filled_at TEXT,
     pnl_cents INTEGER
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS forecasts (
     confidence_high REAL,
     edge REAL NOT NULL,
     reasoning TEXT,
+    strategy TEXT DEFAULT 'calibration_edge',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     actual_outcome INTEGER
 );
@@ -42,6 +44,11 @@ CREATE TABLE IF NOT EXISTS portfolio (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+MIGRATIONS = [
+    "ALTER TABLE trades ADD COLUMN strategy TEXT DEFAULT 'calibration_edge'",
+    "ALTER TABLE forecasts ADD COLUMN strategy TEXT DEFAULT 'calibration_edge'",
+]
 
 
 class PortfolioStore:
@@ -56,7 +63,16 @@ class PortfolioStore:
         await self._db.execute("PRAGMA journal_mode=WAL;")
         await self._db.executescript(SCHEMA)
         await self._db.commit()
+        await self._run_migrations()
         logger.info("portfolio_db_initialized", path=self.db_path)
+
+    async def _run_migrations(self) -> None:
+        for sql in MIGRATIONS:
+            try:
+                await self.db.execute(sql)
+                await self.db.commit()
+            except Exception:
+                pass  # Column already exists
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -73,11 +89,13 @@ class PortfolioStore:
         count: int,
         order_id: str | None = None,
         status: str = "pending",
+        strategy: str = "calibration_edge",
     ) -> int:
         cursor = await self.db.execute(
-            """INSERT INTO trades (ticker, side, action, price_cents, count, order_id, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (ticker, side, action, price_cents, count, order_id, status),
+            """INSERT INTO trades
+               (ticker, side, action, price_cents, count, order_id, status, strategy)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ticker, side, action, price_cents, count, order_id, status, strategy),
         )
         await self.db.commit()
         logger.info(
@@ -100,14 +118,15 @@ class PortfolioStore:
         confidence_low: float | None = None,
         confidence_high: float | None = None,
         reasoning: str | None = None,
+        strategy: str = "calibration_edge",
     ) -> int:
         cursor = await self.db.execute(
             """INSERT INTO forecasts
                (ticker, title, market_price_cents, model_probability, edge,
-                confidence_low, confidence_high, reasoning)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                confidence_low, confidence_high, reasoning, strategy)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (ticker, title, market_price_cents, model_probability, edge,
-             confidence_low, confidence_high, reasoning),
+             confidence_low, confidence_high, reasoning, strategy),
         )
         await self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]

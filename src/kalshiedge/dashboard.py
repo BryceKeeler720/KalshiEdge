@@ -122,6 +122,18 @@ async def get_metrics():
         "SELECT COUNT(*) FROM trades WHERE date(created_at) = ?", (today,)
     )
 
+    # Strategy performance
+    strategy_stats = await store.execute_fetchall(
+        """SELECT
+            COALESCE(strategy, 'calibration_edge') as strat,
+            COUNT(*) as total,
+            SUM(CASE WHEN pnl_cents > 0 THEN 1 ELSE 0 END) as wins,
+            SUM(CASE WHEN pnl_cents < 0 THEN 1 ELSE 0 END) as losses,
+            SUM(CASE WHEN pnl_cents IS NULL THEN 1 ELSE 0 END) as pending,
+            COALESCE(SUM(pnl_cents), 0) as total_pnl
+        FROM trades GROUP BY strat"""
+    )
+
     return {
         "bankroll_cents": bankroll,
         "bankroll_usd": bankroll / 100 if bankroll else 0,
@@ -158,6 +170,18 @@ async def get_metrics():
         "total_forecasts": total_forecasts[0][0],
         "total_resolved": total_resolved,
         "trades_today": trades_today[0][0],
+        "strategies": [
+            {
+                "name": s[0],
+                "total_trades": s[1],
+                "wins": s[2] or 0,
+                "losses": s[3] or 0,
+                "pending": s[4] or 0,
+                "pnl_cents": s[5],
+                "pnl_usd": s[5] / 100,
+            }
+            for s in strategy_stats
+        ],
     }
 
 
@@ -260,6 +284,14 @@ DASHBOARD_HTML = """\
   <div class="card">
     <table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Price</th><th>Qty</th><th>Status</th><th>P&amp;L</th></tr></thead>
     <tbody id="trades-table"></tbody></table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Strategy Performance</h2>
+  <div class="card">
+    <table><thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Pending</th><th>P&amp;L</th></tr></thead>
+    <tbody id="strategy-table"></tbody></table>
   </div>
 </div>
 
@@ -367,6 +399,26 @@ async function refresh() {
         </tr>`;
       }).join('');
     }
+    // Strategy performance
+    const st = document.getElementById('strategy-table');
+    if (!d.strategies || d.strategies.length === 0) {
+      st.innerHTML = '<tr><td colspan="6" class="empty">No strategy data yet</td></tr>';
+    } else {
+      st.innerHTML = d.strategies.map(s => {
+        const pnlClass = s.pnl_cents > 0 ? 'positive' : s.pnl_cents < 0 ? 'negative' : '';
+        const words = s.name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1));
+        const name = words.join(' ');
+        return `<tr>
+          <td>${name}</td>
+          <td>${s.total_trades}</td>
+          <td class="positive">${s.wins}</td>
+          <td class="negative">${s.losses}</td>
+          <td class="neutral">${s.pending}</td>
+          <td class="${pnlClass}">${fmt$(s.pnl_cents)}</td>
+        </tr>`;
+      }).join('');
+    }
+
   } catch(e) { console.error('Refresh failed:', e); }
 }
 

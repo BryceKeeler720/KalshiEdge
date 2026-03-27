@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # Discord
+    discord_webhook_url: str = ""
+
     # Mode
     dry_run: bool = True  # Forecast only, no order execution
 
