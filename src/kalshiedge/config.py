@@ -41,8 +41,10 @@ class Settings(BaseSettings):
     max_position_pct: float = 0.05
     max_exposure_pct: float = 0.50
     max_concurrent_positions: int = 12
-    cycle_interval_seconds: int = 300
-    max_forecasts_per_cycle: int = 5
+    cycle_interval_seconds: int = 600  # Slow loop: discovery + forecasting
+    fast_cycle_seconds: int = 120  # Fast loop: repricing, exits, convergence, arb
+    max_forecasts_per_cycle: int = 10
+    stale_order_minutes: int = 10  # Cancel resting orders older than this
 
     @property
     def kalshi_base_url(self) -> str:

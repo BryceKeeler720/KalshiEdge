@@ -1,7 +1,12 @@
-"""Async entry point — main trading loop."""
+"""Async entry point — dual-loop trading architecture.
+
+Fast loop (2 min): position sync, exits, repricing, convergence, arbitrage
+Slow loop (10 min): market discovery, news, Claude forecasting, batch API
+"""
 
 import asyncio
 import atexit
+import datetime
 import signal
 
 import anthropic
@@ -35,26 +40,23 @@ from kalshiedge.websocket import KalshiWebSocket
 logger = structlog.get_logger()
 
 
+# ---------------------------------------------------------------------------
+# Fast loop — runs every 2 minutes, zero Claude calls
+# ---------------------------------------------------------------------------
+
+
 @observe(span_type=SpanType.AGENT)
-async def run_cycle(
+async def run_fast_cycle(
     kalshi: KalshiClient,
-    claude: anthropic.Anthropic,
     store: PortfolioStore,
     risk: RiskManager,
     alerts: AlertManager,
-    batch: BatchForecaster | None = None,
     ws: KalshiWebSocket | None = None,
 ) -> None:
-    """Single discovery -> forecast -> trade cycle."""
-    logger.info("cycle_start")
+    """Fast cycle: position management, repricing, convergence, arbitrage."""
+    logger.info("fast_cycle_start")
 
-    # Cancel stale resting orders from previous cycles so we can re-price
-    try:
-        await _cancel_stale_resting_orders(kalshi, store)
-    except Exception:
-        logger.exception("stale_order_cancel_failed")
-
-    # Phase 4: Sync positions, check settlements, evaluate exits
+    # Sync positions and bankroll from Kalshi
     try:
         positions = await sync_positions(kalshi, store)
         await check_settlements(kalshi, store)
@@ -65,19 +67,46 @@ async def run_cycle(
     except Exception:
         logger.exception("position_management_failed")
 
-    # Strategy 2: Near-Expiry Convergence (no Claude calls needed)
+    # Cancel stale resting orders (older than configured threshold)
+    try:
+        await _cancel_stale_resting_orders(kalshi, store)
+    except Exception:
+        logger.exception("stale_order_cancel_failed")
+
+    # Strategy 2: Near-Expiry Convergence (no Claude calls)
     try:
         await run_near_expiry_convergence(kalshi, store, risk)
     except Exception:
         logger.exception("convergence_strategy_failed")
 
-    # Strategy 4: Intra-Event Arbitrage (no Claude calls needed)
+    # Strategy 4: Intra-Event Arbitrage (no Claude calls)
     try:
         await run_intra_event_arbitrage(kalshi, store, risk)
     except Exception:
         logger.exception("arbitrage_strategy_failed")
 
-    # Collect batch results from previous cycle (if any)
+    logger.info("fast_cycle_complete")
+
+
+# ---------------------------------------------------------------------------
+# Slow loop — runs every 10 minutes, uses Claude for forecasting
+# ---------------------------------------------------------------------------
+
+
+@observe(span_type=SpanType.AGENT)
+async def run_slow_cycle(
+    kalshi: KalshiClient,
+    claude: anthropic.Anthropic,
+    store: PortfolioStore,
+    risk: RiskManager,
+    alerts: AlertManager,
+    batch: BatchForecaster | None = None,
+    ws: KalshiWebSocket | None = None,
+) -> None:
+    """Slow cycle: discovery, news, forecasting, batch submit/collect."""
+    logger.info("slow_cycle_start")
+
+    # Collect batch results from previous slow cycle
     if batch and batch.has_pending_batch:
         try:
             batch_results = batch.collect_results()
@@ -88,13 +117,13 @@ async def run_cycle(
         except Exception:
             logger.exception("batch_collection_failed")
 
-    # Discover markets for Strategy 1 (Calibration Edge) + Strategy 3 (Event-Driven)
+    # Discover markets
     markets = await discover_markets(kalshi)
     if not markets:
         logger.info("no_markets_found")
         return
 
-    # Strategy 3: Prioritize event-driven markets
+    # Prioritize event-driven markets (Strategy 3)
     event_markets = await find_event_driven_markets(markets)
 
     # Combine: event-driven first, then top by volume, deduplicated
@@ -112,24 +141,28 @@ async def run_cycle(
 
     cap = settings.max_forecasts_per_cycle
     selected = prioritized[:cap]
-    logger.info("markets_selected", count=len(selected), cap=cap)
 
     # Skip tickers we already have open trades on
     open_trades = await store.get_open_positions()
     open_tickers = {t["ticker"] for t in open_trades}
     selected = [m for m in selected if m.ticker not in open_tickers]
+    logger.info("markets_selected", count=len(selected), cap=cap)
 
-    # Subscribe WebSocket to selected tickers for real-time prices
+    if not selected:
+        logger.info("slow_cycle_complete", markets_processed=0)
+        return
+
+    # Subscribe WebSocket to selected tickers
     if ws:
         await ws.subscribe_tickers([m.ticker for m in selected])
 
-    # Gather news for all markets first
+    # Gather news for all selected markets
     markets_with_news = []
     for market in selected:
         news = await gather_news(market.title)
         markets_with_news.append((market, news))
 
-    # Submit batch forecast (results collected next cycle — 50% cheaper)
+    # Submit batch forecast for next cycle (50% cheaper)
     if batch and not batch.has_pending_batch and markets_with_news:
         try:
             batch.submit_batch([
@@ -145,9 +178,9 @@ async def run_cycle(
         except Exception:
             logger.exception("batch_submit_failed")
 
-    # Also run synchronous forecasts for immediate trading (first cycle or fallback)
+    # Run synchronous forecasts for immediate trading
     event_tickers = {m.ticker for m in event_markets}
-    for market, news in markets_with_news:
+    for market, _news in markets_with_news:
         strategy = "event_driven" if market.ticker in event_tickers else "calibration_edge"
         try:
             await _process_market(
@@ -156,10 +189,15 @@ async def run_cycle(
         except Exception:
             logger.exception("market_processing_failed", ticker=market.ticker)
             await alerts.notify_error(
-                f"Failed processing {market.ticker}", context="run_cycle"
+                f"Failed processing {market.ticker}", context="slow_cycle"
             )
 
-    logger.info("cycle_complete", markets_processed=len(selected))
+    logger.info("slow_cycle_complete", markets_processed=len(selected))
+
+
+# ---------------------------------------------------------------------------
+# Market processing (shared by sync and batch paths)
+# ---------------------------------------------------------------------------
 
 
 async def _process_market(
@@ -207,18 +245,34 @@ async def _process_market(
         logger.info("no_edge", ticker=market.ticker, edge=edge, net_edge=effective_edge)
         return
 
-    # Calculate position size
+    await _execute_signal(
+        kalshi, store, risk, alerts, market.ticker, side,
+        result.probability, market, effective_edge, strategy,
+    )
+
+
+async def _execute_signal(
+    kalshi: KalshiClient,
+    store: PortfolioStore,
+    risk: RiskManager,
+    alerts: AlertManager,
+    ticker: str,
+    side: str,
+    model_prob: float,
+    market: Market,
+    effective_edge: float,
+    strategy: str,
+) -> None:
+    """Size, risk-check, and place an order."""
     bankroll = await store.get_bankroll_cents() or settings.bankroll_cents
     size_mult = await risk.size_adjustment()
 
-    # Price at the current ask to maximize fill probability
-    # For YES: buy at yes_ask. For NO: buy at no_ask (= 100 - yes_bid).
     if side == "yes":
         price = market.yes_ask if market.yes_ask > 0 else market.last_price
-        budget = int(quarter_kelly(result.probability, price, bankroll) * size_mult)
+        budget = int(quarter_kelly(model_prob, price, bankroll) * size_mult)
     else:
         price = market.no_ask if market.no_ask > 0 else (100 - market.last_price)
-        p_no = 1 - result.probability
+        p_no = 1 - model_prob
         budget = int(quarter_kelly(p_no, price, bankroll) * size_mult)
 
     if budget <= 0 or price <= 0:
@@ -228,59 +282,38 @@ async def _process_market(
     if count <= 0:
         return
 
-    # Risk check
     trade = ProposedTrade(
-        ticker=market.ticker,
-        side=side,
-        action="buy",
-        price_cents=price,
-        count=count,
-        edge=effective_edge,
+        ticker=ticker, side=side, action="buy",
+        price_cents=price, count=count, edge=effective_edge,
     )
     if not await risk.can_trade(trade):
         return
 
-    # Dry run — log the signal but don't execute
     if settings.dry_run:
         logger.info(
             "dry_run_signal",
-            ticker=market.ticker,
-            side=side,
-            count=count,
-            price_cents=price,
-            edge=f"{effective_edge:.1%}",
-            model_prob=f"{result.probability:.1%}",
-            market_price=market.last_price,
-            reasoning=result.reasoning[:120] if result.reasoning else "",
+            ticker=ticker, side=side, count=count, price_cents=price,
+            edge=f"{effective_edge:.1%}", model_prob=f"{model_prob:.1%}",
+            strategy=strategy,
         )
         return
 
-    # Execute
-    order = await place_limit_order(kalshi, market.ticker, side, count, price)
+    order = await place_limit_order(kalshi, ticker, side, count, price)
     if order is None:
         return
 
     order_id = order.get("order_id", "")
     await store.record_trade(
-        ticker=market.ticker,
-        side=side,
-        action="buy",
-        price_cents=price,
-        count=count,
-        order_id=order_id,
-        strategy=strategy,
+        ticker=ticker, side=side, action="buy",
+        price_cents=price, count=count,
+        order_id=order_id, strategy=strategy,
     )
     await alerts.notify_trade(
-        ticker=market.ticker,
-        side=side,
-        action="buy",
-        count=count,
-        price_cents=price,
-        edge=effective_edge,
+        ticker=ticker, side=side, action="buy",
+        count=count, price_cents=price,
+        edge=effective_edge, strategy=strategy,
     )
-
-    # Non-blocking fill monitor
-    asyncio.create_task(_track_fill(kalshi, store, order_id, market.ticker))
+    asyncio.create_task(_track_fill(kalshi, store, order_id, ticker))
 
 
 async def _process_batch_results(
@@ -291,6 +324,9 @@ async def _process_batch_results(
     results: dict[str, dict],
 ) -> None:
     """Process forecast results from a completed batch and execute trades."""
+    from kalshiedge.discovery import Market as _Market
+    from kalshiedge.discovery import _dollars_to_cents
+
     for ticker, forecast in results.items():
         prob = forecast["probability"]
         price_cents = forecast["price_cents"]
@@ -300,11 +336,9 @@ async def _process_batch_results(
         effective_edge = net_edge(prob, price_cents)
 
         await store.record_forecast(
-            ticker=ticker,
-            title=title,
+            ticker=ticker, title=title,
             market_price_cents=price_cents,
-            model_probability=prob,
-            edge=edge,
+            model_probability=prob, edge=edge,
             confidence_low=forecast.get("confidence_low"),
             confidence_high=forecast.get("confidence_high"),
             reasoning=forecast.get("reasoning"),
@@ -318,60 +352,28 @@ async def _process_batch_results(
         try:
             market_data = await kalshi.get_market(ticker)
             m = market_data.get("market", market_data)
-            from kalshiedge.discovery import _dollars_to_cents
-
-            fresh_price = _dollars_to_cents(
-                m.get("yes_ask_dollars") or m.get("last_price_dollars")
+            yes_ask = _dollars_to_cents(m.get("yes_ask_dollars"))
+            no_ask = _dollars_to_cents(m.get("no_ask_dollars"))
+            last = _dollars_to_cents(
+                m.get("last_price_dollars") or m.get("last_price")
             )
-            if fresh_price <= 0:
-                fresh_price = price_cents
         except Exception:
-            fresh_price = price_cents
+            yes_ask = price_cents
+            no_ask = 100 - price_cents
+            last = price_cents
 
-        if side == "yes":
-            price = fresh_price
-        else:
-            price = 100 - fresh_price
-
-        bankroll = await store.get_bankroll_cents() or settings.bankroll_cents
-        size_mult = await risk.size_adjustment()
-        p_side = prob if side == "yes" else (1 - prob)
-        budget = int(quarter_kelly(p_side, price, bankroll) * size_mult)
-
-        if budget <= 0 or price <= 0:
-            continue
-        count = budget // price
-        if count <= 0:
-            continue
-
-        trade = ProposedTrade(
-            ticker=ticker, side=side, action="buy",
-            price_cents=price, count=count, edge=effective_edge,
+        # Build a minimal Market for _execute_signal
+        market_obj = _Market(
+            ticker=ticker, title=title,
+            yes_bid=0, yes_ask=yes_ask or last,
+            no_bid=0, no_ask=no_ask or (100 - last),
+            last_price=last, volume=0, volume_24h=0,
+            open_interest=0, close_time="",
         )
-        if not await risk.can_trade(trade):
-            continue
-
-        if settings.dry_run:
-            logger.info(
-                "batch_dry_run_signal",
-                ticker=ticker, side=side, count=count,
-                price_cents=price, edge=f"{effective_edge:.1%}",
-            )
-            continue
-
-        order = await place_limit_order(kalshi, ticker, side, count, price)
-        if order:
-            await store.record_trade(
-                ticker=ticker, side=side, action="buy",
-                price_cents=price, count=count,
-                order_id=order.get("order_id", ""),
-                strategy="batch_calibration_edge",
-            )
-            await alerts.notify_trade(
-                ticker=ticker, side=side, action="buy",
-                count=count, price_cents=price, edge=effective_edge,
-                strategy="batch_calibration_edge",
-            )
+        await _execute_signal(
+            kalshi, store, risk, alerts, ticker, side,
+            prob, market_obj, effective_edge, "batch_calibration_edge",
+        )
 
     logger.info("batch_results_processed", count=len(results))
 
@@ -386,20 +388,41 @@ async def _track_fill(
 async def _cancel_stale_resting_orders(
     kalshi: KalshiClient, store: PortfolioStore
 ) -> None:
-    """Cancel all resting orders so we can re-evaluate and re-price."""
+    """Cancel resting orders older than stale_order_minutes."""
     try:
         orders_data = await kalshi.get_orders(status="resting")
         orders = orders_data.get("orders", [])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        threshold = datetime.timedelta(minutes=settings.stale_order_minutes)
+        cancelled = 0
+
         for order in orders:
+            created = order.get("created_time", "")
+            if created:
+                try:
+                    order_time = datetime.datetime.fromisoformat(
+                        created.replace("Z", "+00:00")
+                    )
+                    if (now - order_time) < threshold:
+                        continue  # Not stale yet — let it fill
+                except ValueError:
+                    pass
+
             order_id = order.get("order_id")
             if order_id:
                 await kalshi.cancel_order(order_id)
                 await store.update_trade_status(order_id, "canceled")
-                logger.info("stale_order_cancelled", order_id=order_id)
-        if orders:
-            logger.info("stale_orders_cancelled", count=len(orders))
+                cancelled += 1
+
+        if cancelled:
+            logger.info("stale_orders_cancelled", count=cancelled)
     except Exception:
         logger.warning("stale_order_cancel_failed")
+
+
+# ---------------------------------------------------------------------------
+# Entry point — dual loop scheduler
+# ---------------------------------------------------------------------------
 
 
 async def main() -> None:
@@ -416,7 +439,8 @@ async def main() -> None:
         env=settings.kalshi_env,
         dry_run=settings.dry_run,
         bankroll_usd=settings.bankroll_usd,
-        cycle_interval=settings.cycle_interval_seconds,
+        fast_interval=settings.fast_cycle_seconds,
+        slow_interval=settings.cycle_interval_seconds,
     )
     if settings.dry_run:
         logger.info("dry_run_mode — forecasts only, no orders will be placed")
@@ -467,7 +491,7 @@ async def main() -> None:
     logger.info("batch_forecaster_initialized")
 
     # WebSocket for real-time data
-    ws = KalshiWebSocket()
+    ws: KalshiWebSocket | None = KalshiWebSocket()
     try:
         await ws.start()
     except Exception:
@@ -484,22 +508,38 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _signal_handler)
 
+    # Track when slow cycle last ran
+    last_slow_cycle = 0.0
+
     try:
         while not shutdown_event.is_set():
-            try:
-                await run_cycle(
-                    kalshi, claude, store, risk, alerts, batch=batch, ws=ws
-                )
-            except Exception:
-                logger.exception("cycle_failed")
-                await alerts.notify_error("Cycle failed", context="main_loop")
+            now = asyncio.get_event_loop().time()
 
+            # Always run fast cycle
+            try:
+                await run_fast_cycle(kalshi, store, risk, alerts, ws=ws)
+            except Exception:
+                logger.exception("fast_cycle_failed")
+
+            # Run slow cycle if enough time has passed
+            if (now - last_slow_cycle) >= settings.cycle_interval_seconds:
+                try:
+                    await run_slow_cycle(
+                        kalshi, claude, store, risk, alerts,
+                        batch=batch, ws=ws,
+                    )
+                except Exception:
+                    logger.exception("slow_cycle_failed")
+                    await alerts.notify_error("Slow cycle failed", context="main_loop")
+                last_slow_cycle = now
+
+            # Wait for fast cycle interval
             try:
                 await asyncio.wait_for(
-                    shutdown_event.wait(), timeout=settings.cycle_interval_seconds
+                    shutdown_event.wait(), timeout=settings.fast_cycle_seconds
                 )
             except asyncio.TimeoutError:
-                pass  # Normal — time to run next cycle
+                pass
     finally:
         if ws:
             await ws.stop()
