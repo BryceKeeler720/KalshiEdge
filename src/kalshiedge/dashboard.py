@@ -1,0 +1,378 @@
+"""FastAPI dashboard for KalshiEdge metrics."""
+
+import datetime
+
+import structlog
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+from kalshiedge.calibration import brier_score
+from kalshiedge.config import settings
+from kalshiedge.kalshi_client import KalshiClient
+from kalshiedge.portfolio import PortfolioStore
+
+logger = structlog.get_logger()
+
+app = FastAPI(title="KalshiEdge Dashboard")
+store = PortfolioStore()
+kalshi = KalshiClient()
+
+
+@app.on_event("startup")
+async def startup():
+    await store.initialize()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await store.close()
+    await kalshi.close()
+
+
+@app.get("/api/live")
+async def get_live():
+    """Fetch real-time data from Kalshi production API."""
+    result = {
+        "env": settings.kalshi_env,
+        "dry_run": settings.dry_run,
+        "balance_cents": None,
+        "balance_usd": None,
+        "kalshi_positions": [],
+        "error": None,
+    }
+    try:
+        bal = await kalshi.get_balance()
+        cents = bal.get("balance", 0)
+        result["balance_cents"] = cents
+        result["balance_usd"] = cents / 100
+    except Exception as e:
+        result["error"] = str(e)
+        logger.warning("live_balance_fetch_failed", error=str(e))
+
+    try:
+        pos = await kalshi.get_positions()
+        positions = pos.get("market_positions", pos.get("positions", []))
+        result["kalshi_positions"] = [
+            {
+                "ticker": p.get("ticker", ""),
+                "side": _pos_side(p),
+                "quantity": _pos_qty(p),
+                "market_value": p.get("market_exposure", 0),
+            }
+            for p in positions
+            if _pos_qty(p) > 0
+        ]
+    except Exception as e:
+        if not result["error"]:
+            result["error"] = str(e)
+        logger.warning("live_positions_fetch_failed", error=str(e))
+
+    return result
+
+
+def _pos_side(p: dict) -> str:
+    yes = p.get("yes_contracts", p.get("total_traded", 0))
+    no = p.get("no_contracts", 0)
+    if isinstance(yes, (int, float)) and yes > 0:
+        return "yes"
+    if isinstance(no, (int, float)) and no > 0:
+        return "no"
+    return "yes"
+
+
+def _pos_qty(p: dict) -> int:
+    yes = p.get("yes_contracts", 0)
+    no = p.get("no_contracts", 0)
+    try:
+        return max(int(yes or 0), int(no or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
+@app.get("/api/metrics")
+async def get_metrics():
+    bankroll = await store.get_bankroll_cents()
+    daily_pnl = await store.get_daily_pnl_cents()
+    positions = await store.get_open_positions()
+
+    trades = await store.execute_fetchall(
+        "SELECT ticker, side, action, price_cents, count, status, created_at, pnl_cents "
+        "FROM trades ORDER BY created_at DESC LIMIT 20"
+    )
+
+    forecasts = await store.execute_fetchall(
+        "SELECT ticker, title, market_price_cents, model_probability, edge, reasoning, "
+        "created_at, actual_outcome "
+        "FROM forecasts ORDER BY created_at DESC LIMIT 20"
+    )
+
+    resolved = await store.execute_fetchall(
+        "SELECT model_probability, actual_outcome FROM forecasts "
+        "WHERE actual_outcome IS NOT NULL"
+    )
+    resolved_pairs = [(r[0], r[1]) for r in resolved]
+    brier = brier_score(resolved_pairs) if resolved_pairs else None
+
+    total_trades = await store.execute_fetchall("SELECT COUNT(*) FROM trades")
+    total_forecasts = await store.execute_fetchall("SELECT COUNT(*) FROM forecasts")
+    total_resolved = len(resolved_pairs)
+
+    today = datetime.date.today().isoformat()
+    trades_today = await store.execute_fetchall(
+        "SELECT COUNT(*) FROM trades WHERE date(created_at) = ?", (today,)
+    )
+
+    return {
+        "bankroll_cents": bankroll,
+        "bankroll_usd": bankroll / 100 if bankroll else 0,
+        "daily_pnl_cents": daily_pnl,
+        "daily_pnl_usd": daily_pnl / 100,
+        "open_positions": len(positions),
+        "positions": [
+            {
+                "ticker": p["ticker"],
+                "side": p["side"],
+                "price_cents": p["price_cents"],
+                "count": p["count"],
+                "status": p["status"],
+            }
+            for p in positions
+        ],
+        "recent_trades": [
+            {
+                "ticker": t[0], "side": t[1], "action": t[2], "price_cents": t[3],
+                "count": t[4], "status": t[5], "created_at": t[6], "pnl_cents": t[7],
+            }
+            for t in trades
+        ],
+        "recent_forecasts": [
+            {
+                "ticker": f[0], "title": f[1], "market_price_cents": f[2],
+                "model_probability": f[3], "edge": f[4], "reasoning": f[5],
+                "created_at": f[6], "resolved": f[7] is not None, "outcome": f[7],
+            }
+            for f in forecasts
+        ],
+        "brier_score": round(brier, 4) if brier is not None else None,
+        "total_trades": total_trades[0][0],
+        "total_forecasts": total_forecasts[0][0],
+        "total_resolved": total_resolved,
+        "trades_today": trades_today[0][0],
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return DASHBOARD_HTML
+
+
+DASHBOARD_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KalshiEdge Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+    --text: #e1e4ed; --muted: #8b8fa3; --accent: #6c5ce7;
+    --green: #00b894; --red: #e17055; --yellow: #fdcb6e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    background: var(--bg); color: var(--text); padding: 24px;
+    min-height: 100vh;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 8px; }
+  .subtitle { color: var(--muted); font-size: 0.8rem; margin-bottom: 24px; }
+  .mode-live { color: var(--red); font-weight: 600; }
+  .mode-dry { color: var(--yellow); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .card-label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .card-value { font-size: 1.6rem; font-weight: 700; margin-top: 4px; }
+  .positive { color: var(--green); }
+  .negative { color: var(--red); }
+  .neutral { color: var(--yellow); }
+  h2 { font-size: 1rem; margin-bottom: 12px; color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 12px;
+       border-bottom: 1px solid var(--border); font-size: 0.7rem; text-transform: uppercase; }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  tr:hover { background: rgba(108, 92, 231, 0.05); }
+  .section { margin-bottom: 32px; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 0.7rem; font-weight: 600;
+  }
+  .badge-yes { background: rgba(0,184,148,0.15); color: var(--green); }
+  .badge-no { background: rgba(225,112,85,0.15); color: var(--red); }
+  .badge-pending { background: rgba(253,203,110,0.15); color: var(--yellow); }
+  .badge-executed { background: rgba(0,184,148,0.15); color: var(--green); }
+  .badge-resting { background: rgba(253,203,110,0.15); color: var(--yellow); }
+  .edge-bar {
+    display: inline-block; height: 6px; border-radius: 3px;
+    background: var(--accent); min-width: 4px;
+  }
+  .refresh-note { color: var(--muted); font-size: 0.7rem; text-align: right; }
+  .empty { color: var(--muted); font-style: italic; padding: 24px; text-align: center; }
+  .error-banner { background: rgba(225,112,85,0.1); border: 1px solid var(--red); border-radius: 6px; padding: 10px 14px; margin-bottom: 16px; color: var(--red); font-size: 0.8rem; display: none; }
+</style>
+</head>
+<body>
+
+<h1>KalshiEdge</h1>
+<p class="subtitle">Autonomous Kalshi Trading Agent &mdash; <span id="env">--</span> &mdash; <span id="updated"></span></p>
+<div class="error-banner" id="error-banner"></div>
+
+<div class="grid" id="cards">
+  <div class="card"><div class="card-label">Kalshi Balance</div><div class="card-value" id="balance">--</div></div>
+  <div class="card"><div class="card-label">Daily P&amp;L</div><div class="card-value" id="pnl">--</div></div>
+  <div class="card"><div class="card-label">Kalshi Positions</div><div class="card-value" id="live-positions">--</div></div>
+  <div class="card"><div class="card-label">Trades Today</div><div class="card-value" id="trades-today">--</div></div>
+  <div class="card"><div class="card-label">Brier Score</div><div class="card-value" id="brier">--</div></div>
+  <div class="card"><div class="card-label">Total Forecasts</div><div class="card-value" id="total-forecasts">--</div></div>
+</div>
+
+<div class="section">
+  <h2>Kalshi Positions (Live)</h2>
+  <div class="card">
+    <table><thead><tr><th>Ticker</th><th>Side</th><th>Quantity</th></tr></thead>
+    <tbody id="kalshi-positions-table"></tbody></table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Recent Forecasts</h2>
+  <div class="card">
+    <table><thead><tr><th>Time</th><th>Ticker</th><th>Market</th><th>Model</th><th>Edge</th><th>Outcome</th></tr></thead>
+    <tbody id="forecasts-table"></tbody></table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Recent Trades</h2>
+  <div class="card">
+    <table><thead><tr><th>Time</th><th>Ticker</th><th>Side</th><th>Price</th><th>Qty</th><th>Status</th><th>P&amp;L</th></tr></thead>
+    <tbody id="trades-table"></tbody></table>
+  </div>
+</div>
+
+<p class="refresh-note">Auto-refreshes every 30s</p>
+
+<script>
+function fmt$(cents) {
+  if (cents == null) return '--';
+  const d = cents / 100;
+  return (d >= 0 ? '+' : '') + '$' + Math.abs(d).toFixed(2);
+}
+function badge(text, cls) { return `<span class="badge badge-${cls}">${text}</span>`; }
+function pct(v) { return v != null ? (v * 100).toFixed(1) + '%' : '--'; }
+function shortTime(ts) {
+  if (!ts) return '--';
+  const d = new Date(ts);
+  return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+async function refresh() {
+  try {
+    const [mRes, lRes] = await Promise.all([
+      fetch('/api/metrics'),
+      fetch('/api/live'),
+    ]);
+    const d = await mRes.json();
+    const live = await lRes.json();
+
+    // Env / mode
+    const envEl = document.getElementById('env');
+    if (live.dry_run) {
+      envEl.innerHTML = `<span class="mode-dry">${live.env.toUpperCase()} (DRY RUN)</span>`;
+    } else {
+      envEl.innerHTML = `<span class="mode-live">${live.env.toUpperCase()} (LIVE)</span>`;
+    }
+
+    // Error banner
+    const errEl = document.getElementById('error-banner');
+    if (live.error) {
+      errEl.textContent = 'Kalshi API: ' + live.error;
+      errEl.style.display = 'block';
+    } else {
+      errEl.style.display = 'none';
+    }
+
+    // Balance — prefer live Kalshi balance
+    const balUsd = live.balance_usd != null ? live.balance_usd : d.bankroll_usd;
+    document.getElementById('balance').textContent = '$' + balUsd.toFixed(2);
+
+    const pnlEl = document.getElementById('pnl');
+    pnlEl.textContent = fmt$(d.daily_pnl_cents);
+    pnlEl.className = 'card-value ' + (d.daily_pnl_cents > 0 ? 'positive' : d.daily_pnl_cents < 0 ? 'negative' : '');
+
+    document.getElementById('live-positions').textContent = live.kalshi_positions.length;
+    document.getElementById('trades-today').textContent = d.trades_today;
+    document.getElementById('brier').textContent = d.brier_score != null ? d.brier_score.toFixed(4) : 'N/A';
+    document.getElementById('total-forecasts').textContent = d.total_forecasts + (d.total_resolved > 0 ? ` (${d.total_resolved} resolved)` : '');
+    document.getElementById('updated').textContent = new Date().toLocaleTimeString();
+
+    // Kalshi live positions
+    const kpt = document.getElementById('kalshi-positions-table');
+    if (live.kalshi_positions.length === 0) {
+      kpt.innerHTML = '<tr><td colspan="3" class="empty">No open positions on Kalshi</td></tr>';
+    } else {
+      kpt.innerHTML = live.kalshi_positions.map(p => `<tr>
+        <td>${p.ticker}</td>
+        <td>${badge(p.side.toUpperCase(), p.side)}</td>
+        <td>${p.quantity}</td>
+      </tr>`).join('');
+    }
+
+    // Forecasts
+    const ft = document.getElementById('forecasts-table');
+    if (d.recent_forecasts.length === 0) {
+      ft.innerHTML = '<tr><td colspan="6" class="empty">No forecasts yet &mdash; run the agent to generate forecasts</td></tr>';
+    } else {
+      ft.innerHTML = d.recent_forecasts.map(f => {
+        const edgeW = Math.min(Math.abs(f.edge) * 500, 100);
+        return `<tr>
+          <td>${shortTime(f.created_at)}</td>
+          <td>${f.ticker}</td>
+          <td>${f.market_price_cents}&cent;</td>
+          <td>${pct(f.model_probability)}</td>
+          <td><span class="edge-bar" style="width:${edgeW}px"></span> ${pct(f.edge)}</td>
+          <td>${f.resolved ? (f.outcome === 1 ? badge('YES','yes') : badge('NO','no')) : '--'}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    // Trades
+    const tt = document.getElementById('trades-table');
+    if (d.recent_trades.length === 0) {
+      tt.innerHTML = '<tr><td colspan="7" class="empty">No trades yet</td></tr>';
+    } else {
+      tt.innerHTML = d.recent_trades.map(t => {
+        const pnlClass = t.pnl_cents > 0 ? 'positive' : t.pnl_cents < 0 ? 'negative' : '';
+        return `<tr>
+          <td>${shortTime(t.created_at)}</td>
+          <td>${t.ticker}</td>
+          <td>${badge(t.side.toUpperCase(), t.side)}</td>
+          <td>${t.price_cents}&cent;</td>
+          <td>${t.count}</td>
+          <td>${badge(t.status, t.status === 'executed' ? 'executed' : t.status)}</td>
+          <td class="${pnlClass}">${t.pnl_cents != null ? fmt$(t.pnl_cents) : '--'}</td>
+        </tr>`;
+      }).join('');
+    }
+  } catch(e) { console.error('Refresh failed:', e); }
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
+"""
