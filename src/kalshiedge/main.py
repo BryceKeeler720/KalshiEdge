@@ -152,17 +152,26 @@ async def run_slow_cycle(
     markets = boost_event_markets(markets, upcoming_events)
 
     # Combine: event-driven first, then scored, deduplicated
+    # Limit to max 2 markets per event to ensure diversity
+    max_per_event = 2
     markets.sort(key=lambda m: getattr(m, "_score", 0), reverse=True)
     seen_tickers: set[str] = set()
+    event_counts: dict[str, int] = {}
     prioritized: list[Market] = []
     for m in event_markets:
         if m.ticker not in seen_tickers:
             seen_tickers.add(m.ticker)
             prioritized.append(m)
     for m in markets:
-        if m.ticker not in seen_tickers:
-            seen_tickers.add(m.ticker)
-            prioritized.append(m)
+        if m.ticker in seen_tickers:
+            continue
+        event = m.event_ticker or m.series_ticker or m.ticker
+        count = event_counts.get(event, 0)
+        if count >= max_per_event:
+            continue
+        event_counts[event] = count + 1
+        seen_tickers.add(m.ticker)
+        prioritized.append(m)
 
     cap = settings.max_forecasts_per_cycle
     selected = prioritized[:cap]
