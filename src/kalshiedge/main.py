@@ -11,7 +11,7 @@ from kalshiedge._observe import SpanType, observe
 from kalshiedge.alerts import AlertManager
 from kalshiedge.config import settings
 from kalshiedge.discovery import Market, check_orderbook_depth, discover_markets
-from kalshiedge.edge import compute_edge, kelly_no, net_edge, quarter_kelly
+from kalshiedge.edge import compute_edge, net_edge, quarter_kelly
 from kalshiedge.forecaster import forecast_market
 from kalshiedge.kalshi_client import KalshiClient
 from kalshiedge.portfolio import PortfolioStore
@@ -43,6 +43,12 @@ async def run_cycle(
 ) -> None:
     """Single discovery -> forecast -> trade cycle."""
     logger.info("cycle_start")
+
+    # Cancel stale resting orders from previous cycles so we can re-price
+    try:
+        await _cancel_stale_resting_orders(kalshi, store)
+    except Exception:
+        logger.exception("stale_order_cancel_failed")
 
     # Phase 4: Sync positions, check settlements, evaluate exits
     try:
@@ -165,12 +171,15 @@ async def _process_market(
     bankroll = await store.get_bankroll_cents() or settings.bankroll_cents
     size_mult = await risk.size_adjustment()
 
+    # Price at the current ask to maximize fill probability
+    # For YES: buy at yes_ask. For NO: buy at no_ask (= 100 - yes_bid).
     if side == "yes":
-        budget = int(quarter_kelly(result.probability, market.last_price, bankroll) * size_mult)
-        price = market.last_price
+        price = market.yes_ask if market.yes_ask > 0 else market.last_price
+        budget = int(quarter_kelly(result.probability, price, bankroll) * size_mult)
     else:
-        budget = int(kelly_no(result.probability, market.last_price, bankroll) * size_mult)
-        price = 100 - market.last_price
+        price = market.no_ask if market.no_ask > 0 else (100 - market.last_price)
+        p_no = 1 - result.probability
+        budget = int(quarter_kelly(p_no, price, bankroll) * size_mult)
 
     if budget <= 0 or price <= 0:
         return
@@ -239,6 +248,25 @@ async def _track_fill(
 ) -> None:
     status = await monitor_fill(kalshi, order_id, ticker)
     await store.update_trade_status(order_id, status)
+
+
+async def _cancel_stale_resting_orders(
+    kalshi: KalshiClient, store: PortfolioStore
+) -> None:
+    """Cancel all resting orders so we can re-evaluate and re-price."""
+    try:
+        orders_data = await kalshi.get_orders(status="resting")
+        orders = orders_data.get("orders", [])
+        for order in orders:
+            order_id = order.get("order_id")
+            if order_id:
+                await kalshi.cancel_order(order_id)
+                await store.update_trade_status(order_id, "canceled")
+                logger.info("stale_order_cancelled", order_id=order_id)
+        if orders:
+            logger.info("stale_orders_cancelled", count=len(orders))
+    except Exception:
+        logger.warning("stale_order_cancel_failed")
 
 
 async def main() -> None:
