@@ -7,13 +7,13 @@ import structlog
 from pydantic import BaseModel
 
 from kalshiedge._observe import SpanType, observe
+from kalshiedge.config import settings
 from kalshiedge.kalshi_client import KalshiClient
 
 logger = structlog.get_logger()
 
-MIN_VOLUME = 50  # Lowered — Kalshi has less volume than Polymarket
+MIN_VOLUME = 50
 MIN_HOURS_TO_EXPIRY = 2
-MIN_ORDERBOOK_DEPTH = 2
 PAGE_DELAY = 2.5  # seconds between API calls to avoid rate limits
 
 # Categories where LLMs have strongest forecasting edge
@@ -199,7 +199,8 @@ async def check_orderbook_depth(client: KalshiClient, ticker: str) -> bool:
         book = ob.get("orderbook_fp") or ob.get("orderbook", {})
         yes_levels = len(book.get("yes_dollars") or book.get("yes") or [])
         no_levels = len(book.get("no_dollars") or book.get("no") or [])
-        return yes_levels >= MIN_ORDERBOOK_DEPTH and no_levels >= MIN_ORDERBOOK_DEPTH
+        min_depth = settings.orderbook_min_depth
+        return yes_levels >= min_depth and no_levels >= min_depth
     except Exception:
         logger.warning("orderbook_check_failed", ticker=ticker)
         return False

@@ -11,14 +11,12 @@ import anthropic
 import structlog
 
 from kalshiedge._observe import SpanType, observe
+from kalshiedge.config import settings
 from kalshiedge.edge import aggregate_forecasts
 from kalshiedge.prompts import FORECAST_USER, SUPERFORECASTER_SYSTEM, parse_forecast
 from kalshiedge.research import format_news_context
 
 logger = structlog.get_logger()
-
-TEMPERATURES = [0.3, 0.5, 0.7]
-FORECAST_MODEL = "claude-sonnet-4-6"
 
 
 class BatchForecaster:
@@ -59,15 +57,24 @@ class BatchForecaster:
                 news_context=news_context,
             )
 
-            for i, temp in enumerate(TEMPERATURES):
+            for i, temp in enumerate(settings.temperatures):
                 custom_id = f"{market['ticker']}__temp{i}"
+                # Use cache_control on system prompt for cost savings
+                system_block = [
+                    {
+                        "type": "text",
+                        "text": SUPERFORECASTER_SYSTEM,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ] if settings.prompt_caching else SUPERFORECASTER_SYSTEM
+
                 requests.append({
                     "custom_id": custom_id,
                     "params": {
-                        "model": FORECAST_MODEL,
+                        "model": settings.forecast_model,
                         "max_tokens": 1024,
                         "temperature": temp,
-                        "system": SUPERFORECASTER_SYSTEM,
+                        "system": system_block,
                         "messages": [{"role": "user", "content": user_prompt}],
                     },
                 })

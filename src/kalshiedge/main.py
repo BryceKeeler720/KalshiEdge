@@ -15,6 +15,7 @@ import structlog
 from kalshiedge._observe import SpanType, observe
 from kalshiedge.alerts import AlertManager
 from kalshiedge.batch_forecaster import BatchForecaster
+from kalshiedge.calendar import boost_event_markets, get_upcoming_events
 from kalshiedge.config import settings
 from kalshiedge.discovery import Market, check_orderbook_depth, discover_markets
 from kalshiedge.edge import compute_edge, net_edge, quarter_kelly
@@ -126,6 +127,12 @@ async def run_slow_cycle(
     # Prioritize event-driven markets (Strategy 3)
     event_markets = await find_event_driven_markets(markets)
 
+    # Fetch upcoming economic events for priority boosting
+    try:
+        upcoming_events = await get_upcoming_events()
+    except Exception:
+        upcoming_events = []
+
     # Score markets: prefer high volume + shorter expiry (faster capital turnover)
     now = datetime.datetime.now(datetime.timezone.utc)
     for m in markets:
@@ -140,6 +147,9 @@ async def run_slow_cycle(
                 pass
         # Score: volume / sqrt(days) — rewards high volume + short duration
         m._score = m.volume / (days_to_expiry ** 0.5)  # type: ignore[attr-defined]
+
+    # Boost scores for markets matching upcoming economic events
+    markets = boost_event_markets(markets, upcoming_events)
 
     # Combine: event-driven first, then scored, deduplicated
     markets.sort(key=lambda m: getattr(m, "_score", 0), reverse=True)
@@ -436,6 +446,87 @@ async def _cancel_stale_resting_orders(
 
 
 # ---------------------------------------------------------------------------
+# Circuit breaker — pause slow cycle if Claude is repeatedly failing
+# ---------------------------------------------------------------------------
+
+
+class CircuitBreaker:
+    """Tracks consecutive failures and pauses when threshold is hit."""
+
+    def __init__(self, max_failures: int = 3, cooldown_seconds: int = 1800):
+        self.max_failures = max_failures
+        self.cooldown_seconds = cooldown_seconds
+        self._consecutive_failures = 0
+        self._tripped_until: float = 0
+
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
+
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.max_failures:
+            import time
+
+            self._tripped_until = time.time() + self.cooldown_seconds
+            logger.warning(
+                "circuit_breaker_tripped",
+                failures=self._consecutive_failures,
+                cooldown_seconds=self.cooldown_seconds,
+            )
+
+    @property
+    def is_open(self) -> bool:
+        import time
+
+        if self._tripped_until > 0 and time.time() < self._tripped_until:
+            return True
+        if self._tripped_until > 0 and time.time() >= self._tripped_until:
+            self._tripped_until = 0
+            self._consecutive_failures = 0
+            logger.info("circuit_breaker_reset")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Daily summary
+# ---------------------------------------------------------------------------
+
+
+async def _maybe_send_daily_summary(
+    store: PortfolioStore,
+    alerts: AlertManager,
+    last_summary_date: str,
+) -> str:
+    """Send daily summary if we haven't sent one today. Returns current date."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = now.date().isoformat()
+
+    if today == last_summary_date:
+        return last_summary_date
+
+    if now.hour < settings.daily_summary_hour:
+        return last_summary_date
+
+    bankroll = await store.get_bankroll_cents() or 0
+    daily_pnl = await store.get_daily_pnl_cents()
+    positions = await store.get_open_positions()
+    today_str = datetime.date.today().isoformat()
+    trades_today_rows = await store.execute_fetchall(
+        "SELECT COUNT(*) FROM trades WHERE date(created_at) = ?", (today_str,)
+    )
+    trades_today = trades_today_rows[0][0] if trades_today_rows else 0
+
+    await alerts.notify_daily_summary(
+        balance_cents=bankroll,
+        daily_pnl_cents=daily_pnl,
+        open_positions=len(positions),
+        trades_today=trades_today,
+    )
+    logger.info("daily_summary_sent")
+    return today
+
+
+# ---------------------------------------------------------------------------
 # Entry point — dual loop scheduler
 # ---------------------------------------------------------------------------
 
@@ -525,6 +616,8 @@ async def main() -> None:
 
     # Track when slow cycle last ran
     last_slow_cycle = 0.0
+    last_summary_date = ""
+    breaker = CircuitBreaker()
 
     try:
         while not shutdown_event.is_set():
@@ -536,17 +629,32 @@ async def main() -> None:
             except Exception:
                 logger.exception("fast_cycle_failed")
 
-            # Run slow cycle if enough time has passed
+            # Run slow cycle if enough time has passed (and circuit breaker allows)
             if (now - last_slow_cycle) >= settings.cycle_interval_seconds:
-                try:
-                    await run_slow_cycle(
-                        kalshi, claude, store, risk, alerts,
-                        batch=batch, ws=ws,
-                    )
-                except Exception:
-                    logger.exception("slow_cycle_failed")
-                    await alerts.notify_error("Slow cycle failed", context="main_loop")
+                if breaker.is_open:
+                    logger.info("slow_cycle_skipped_circuit_breaker")
+                else:
+                    try:
+                        await run_slow_cycle(
+                            kalshi, claude, store, risk, alerts,
+                            batch=batch, ws=ws,
+                        )
+                        breaker.record_success()
+                    except Exception:
+                        logger.exception("slow_cycle_failed")
+                        breaker.record_failure()
+                        await alerts.notify_error(
+                            "Slow cycle failed", context="main_loop"
+                        )
                 last_slow_cycle = now
+
+            # Daily summary
+            try:
+                last_summary_date = await _maybe_send_daily_summary(
+                    store, alerts, last_summary_date
+                )
+            except Exception:
+                logger.warning("daily_summary_failed")
 
             # Wait for fast cycle interval
             try:

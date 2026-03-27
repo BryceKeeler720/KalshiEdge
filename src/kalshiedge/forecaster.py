@@ -6,14 +6,12 @@ import anthropic
 import structlog
 
 from kalshiedge._observe import SpanType, observe
+from kalshiedge.config import settings
 from kalshiedge.edge import aggregate_forecasts
 from kalshiedge.prompts import FORECAST_USER, SUPERFORECASTER_SYSTEM, parse_forecast
 from kalshiedge.research import NewsItem, format_news_context
 
 logger = structlog.get_logger()
-
-TEMPERATURES = [0.3, 0.5, 0.7]
-FORECAST_MODEL = "claude-sonnet-4-6"
 
 
 class ForecastResult:
@@ -57,10 +55,10 @@ async def forecast_market(
     raw_probabilities: list[float] = []
     last_parsed: dict | None = None
 
-    for temp in TEMPERATURES:
+    for temp in settings.temperatures:
         try:
             response = client.messages.create(
-                model=FORECAST_MODEL,
+                model=settings.forecast_model,
                 max_tokens=1024,
                 temperature=temp,
                 system=SUPERFORECASTER_SYSTEM,

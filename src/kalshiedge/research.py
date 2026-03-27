@@ -9,10 +9,11 @@ import httpx
 import structlog
 
 from kalshiedge._observe import SpanType, observe
+from kalshiedge.config import settings
 
 logger = structlog.get_logger()
 
-CACHE_TTL_SECONDS = 1800  # 30 minutes
+CACHE_TTL_SECONDS = settings.news_cache_ttl_seconds
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
 

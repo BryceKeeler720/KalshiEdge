@@ -14,9 +14,9 @@ logger = structlog.get_logger()
 # Exit when edge has flipped or shrunk below this threshold
 EXIT_EDGE_THRESHOLD = 0.03
 
-# Stop-loss / take-profit thresholds (based on unrealized P&L %)
-STOP_LOSS_PCT = -0.15   # Exit at 15% loss
-TAKE_PROFIT_PCT = 0.30  # Exit at 30% gain
+
+STOP_LOSS_PCT = settings.stop_loss_pct
+TAKE_PROFIT_PCT = settings.take_profit_pct
 
 
 @observe(span_type=SpanType.RETRIEVAL)

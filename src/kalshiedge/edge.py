@@ -77,8 +77,12 @@ def contracts_from_budget(budget_cents: int, price_cents: int) -> int:
     return budget_cents // price_cents
 
 
-def extremize(p: float, factor: float = 1.3) -> float:
+def extremize(p: float, factor: float | None = None) -> float:
     """Push probability away from 0.5 by multiplying log-odds."""
+    if factor is None:
+        from kalshiedge.config import settings
+
+        factor = settings.extremization_factor
     if p <= 0.01 or p >= 0.99:
         return p
     log_odds = math.log(p / (1 - p))

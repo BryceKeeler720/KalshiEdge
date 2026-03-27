@@ -23,6 +23,7 @@ class Settings(BaseSettings):
 
     # News
     newsapi_key: str = ""
+    news_cache_ttl_seconds: int = 1800
 
     # Telegram
     telegram_bot_token: str = ""
@@ -32,7 +33,13 @@ class Settings(BaseSettings):
     discord_webhook_url: str = ""
 
     # Mode
-    dry_run: bool = True  # Forecast only, no order execution
+    dry_run: bool = True
+
+    # Model configuration
+    forecast_model: str = "claude-sonnet-4-6"
+    forecast_temperatures: str = "0.3,0.5,0.7"  # Comma-separated
+    extremization_factor: float = 1.3
+    prompt_caching: bool = True
 
     # Trading parameters
     bankroll_usd: float = 100.0
@@ -41,10 +48,24 @@ class Settings(BaseSettings):
     max_position_pct: float = 0.05
     max_exposure_pct: float = 0.50
     max_concurrent_positions: int = 12
-    cycle_interval_seconds: int = 600  # Slow loop: discovery + forecasting
-    fast_cycle_seconds: int = 120  # Fast loop: repricing, exits, convergence, arb
+    cycle_interval_seconds: int = 600
+    fast_cycle_seconds: int = 120
     max_forecasts_per_cycle: int = 10
-    stale_order_minutes: int = 10  # Cancel resting orders older than this
+    stale_order_minutes: int = 10
+
+    # Strategy tuning
+    convergence_min_price: int = 93
+    convergence_max_price: int = 97
+    convergence_max_hours: int = 24
+    orderbook_min_depth: int = 2
+    stop_loss_pct: float = -0.15
+    take_profit_pct: float = 0.30
+
+    # Daily summary
+    daily_summary_hour: int = 23  # UTC hour to send daily summary (11pm)
+
+    # Logging
+    log_level: str = "INFO"
 
     @property
     def kalshi_base_url(self) -> str:
@@ -59,6 +80,10 @@ class Settings(BaseSettings):
     @property
     def private_key_pem(self) -> str:
         return Path(self.kalshi_private_key_path).read_text()
+
+    @property
+    def temperatures(self) -> list[float]:
+        return [float(t.strip()) for t in self.forecast_temperatures.split(",")]
 
     @field_validator("kelly_fraction")
     @classmethod

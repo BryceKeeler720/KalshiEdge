@@ -26,9 +26,9 @@ logger = structlog.get_logger()
 # certain. Pure arbitrage — no forecasting needed.
 # ---------------------------------------------------------------------------
 
-CONVERGENCE_MIN_PRICE = 93
-CONVERGENCE_MAX_PRICE = 97
-CONVERGENCE_MAX_HOURS = 24  # Only within 24h of close
+CONVERGENCE_MIN_PRICE = settings.convergence_min_price
+CONVERGENCE_MAX_PRICE = settings.convergence_max_price
+CONVERGENCE_MAX_HOURS = settings.convergence_max_hours
 
 
 @observe(span_type=SpanType.CHAIN)

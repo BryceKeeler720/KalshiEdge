@@ -1,6 +1,7 @@
 """FastAPI dashboard for KalshiEdge metrics."""
 
 import datetime
+import time
 
 import structlog
 from fastapi import FastAPI
@@ -16,6 +17,7 @@ logger = structlog.get_logger()
 app = FastAPI(title="KalshiEdge Dashboard")
 store = PortfolioStore()
 kalshi = KalshiClient()
+_start_time = time.time()
 
 
 @app.on_event("startup")
@@ -27,6 +29,27 @@ async def startup():
 async def shutdown():
     await store.close()
     await kalshi.close()
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint for monitoring."""
+    uptime = time.time() - _start_time
+    total_trades = await store.execute_fetchall("SELECT COUNT(*) FROM trades")
+    total_forecasts = await store.execute_fetchall("SELECT COUNT(*) FROM forecasts")
+    positions = await store.get_open_positions()
+    bankroll = await store.get_bankroll_cents()
+    return {
+        "status": "healthy",
+        "uptime_seconds": int(uptime),
+        "uptime_human": f"{int(uptime // 3600)}h {int((uptime % 3600) // 60)}m",
+        "env": settings.kalshi_env,
+        "dry_run": settings.dry_run,
+        "bankroll_usd": bankroll / 100 if bankroll else 0,
+        "open_positions": len(positions),
+        "total_trades": total_trades[0][0],
+        "total_forecasts": total_forecasts[0][0],
+    }
 
 
 @app.get("/api/live")
