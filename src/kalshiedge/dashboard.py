@@ -208,6 +208,46 @@ async def get_metrics():
     }
 
 
+@app.get("/api/charts")
+async def get_charts():
+    """Chart data for balance history and daily P&L."""
+    snapshots = await store.execute_fetchall(
+        "SELECT date, balance_cents, pnl_cents FROM daily_snapshots ORDER BY date"
+    )
+    # Rolling Brier (last 20 resolved)
+    recent_resolved = await store.execute_fetchall(
+        "SELECT model_probability, actual_outcome FROM forecasts "
+        "WHERE actual_outcome IS NOT NULL ORDER BY created_at DESC LIMIT 20"
+    )
+    rolling_pairs = [(r[0], r[1]) for r in recent_resolved]
+    rolling_brier = brier_score(rolling_pairs) if rolling_pairs else None
+
+    # Max drawdown
+    balances = [s[1] for s in snapshots] if snapshots else []
+    max_dd = 0.0
+    peak = 0
+    for b in balances:
+        if b > peak:
+            peak = b
+        if peak > 0:
+            dd = (peak - b) / peak
+            if dd > max_dd:
+                max_dd = dd
+
+    return {
+        "balance_history": [
+            {"date": s[0], "balance_usd": s[1] / 100}
+            for s in snapshots
+        ],
+        "pnl_history": [
+            {"date": s[0], "pnl_usd": s[2] / 100}
+            for s in snapshots
+        ],
+        "rolling_brier": round(rolling_brier, 4) if rolling_brier is not None else None,
+        "max_drawdown_pct": round(max_dd * 100, 1),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return DASHBOARD_HTML
@@ -284,6 +324,13 @@ DASHBOARD_HTML = """\
   <div class="card"><div class="card-label">Trades Today</div><div class="card-value" id="trades-today">--</div></div>
   <div class="card"><div class="card-label">Brier Score</div><div class="card-value" id="brier">--</div></div>
   <div class="card"><div class="card-label">Total Forecasts</div><div class="card-value" id="total-forecasts">--</div></div>
+  <div class="card"><div class="card-label">Rolling Brier (20)</div><div class="card-value" id="rolling-brier">--</div></div>
+  <div class="card"><div class="card-label">Max Drawdown</div><div class="card-value" id="max-drawdown">--</div></div>
+</div>
+
+<div class="section" style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <div class="card"><h2 style="margin-bottom:8px">Balance History</h2><canvas id="balance-chart" height="200"></canvas></div>
+  <div class="card"><h2 style="margin-bottom:8px">Daily P&amp;L</h2><canvas id="pnl-chart" height="200"></canvas></div>
 </div>
 
 <div class="section">
@@ -320,6 +367,7 @@ DASHBOARD_HTML = """\
 
 <p class="refresh-note">Auto-refreshes every 30s</p>
 
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script>
 function fmt$(cents) {
   if (cents == null) return '--';
@@ -445,8 +493,47 @@ async function refresh() {
   } catch(e) { console.error('Refresh failed:', e); }
 }
 
+let balChart = null, pnlChart = null;
+const chartOpts = {responsive:true, plugins:{legend:{display:false}}, scales:{x:{ticks:{color:'#8b8fa3',font:{size:10}}}, y:{ticks:{color:'#8b8fa3'}}}};
+
+async function refreshCharts() {
+  try {
+    const r = await fetch('/api/charts');
+    const c = await r.json();
+
+    // Rolling Brier + drawdown
+    document.getElementById('rolling-brier').textContent = c.rolling_brier != null ? c.rolling_brier.toFixed(4) : 'N/A';
+    const ddEl = document.getElementById('max-drawdown');
+    ddEl.textContent = c.max_drawdown_pct + '%';
+    ddEl.className = 'card-value ' + (c.max_drawdown_pct > 20 ? 'negative' : c.max_drawdown_pct > 10 ? 'neutral' : 'positive');
+
+    // Balance chart
+    if (c.balance_history.length > 0) {
+      const labels = c.balance_history.map(d => d.date.slice(5));
+      const data = c.balance_history.map(d => d.balance_usd);
+      if (balChart) balChart.destroy();
+      balChart = new Chart(document.getElementById('balance-chart'), {
+        type: 'line', data: {labels, datasets: [{data, borderColor:'#6c5ce7', backgroundColor:'rgba(108,92,231,0.1)', fill:true, tension:0.3, pointRadius:2}]}, options: chartOpts
+      });
+    }
+
+    // P&L chart
+    if (c.pnl_history.length > 0) {
+      const labels = c.pnl_history.map(d => d.date.slice(5));
+      const data = c.pnl_history.map(d => d.pnl_usd);
+      const colors = data.map(v => v >= 0 ? '#00b894' : '#e17055');
+      if (pnlChart) pnlChart.destroy();
+      pnlChart = new Chart(document.getElementById('pnl-chart'), {
+        type: 'bar', data: {labels, datasets: [{data, backgroundColor:colors}]}, options: chartOpts
+      });
+    }
+  } catch(e) { console.error('Chart refresh failed:', e); }
+}
+
 refresh();
+refreshCharts();
 setInterval(refresh, 30000);
+setInterval(refreshCharts, 60000);
 </script>
 </body>
 </html>

@@ -516,6 +516,20 @@ async def _maybe_send_daily_summary(
     )
     trades_today = trades_today_rows[0][0] if trades_today_rows else 0
 
+    total_forecasts_rows = await store.execute_fetchall(
+        "SELECT COUNT(*) FROM forecasts WHERE date(created_at) = ?", (today_str,)
+    )
+    forecasts_today = total_forecasts_rows[0][0] if total_forecasts_rows else 0
+
+    # Record daily snapshot for charts
+    await store.record_daily_snapshot(
+        balance_cents=bankroll,
+        pnl_cents=daily_pnl,
+        open_positions=len(positions),
+        trades=trades_today,
+        forecasts=forecasts_today,
+    )
+
     await alerts.notify_daily_summary(
         balance_cents=bankroll,
         daily_pnl_cents=daily_pnl,

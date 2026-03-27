@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS portfolio (
 MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN strategy TEXT DEFAULT 'calibration_edge'",
     "ALTER TABLE forecasts ADD COLUMN strategy TEXT DEFAULT 'calibration_edge'",
+    """CREATE TABLE IF NOT EXISTS daily_snapshots (
+        date TEXT PRIMARY KEY,
+        balance_cents INTEGER NOT NULL,
+        pnl_cents INTEGER DEFAULT 0,
+        open_positions INTEGER DEFAULT 0,
+        trades INTEGER DEFAULT 0,
+        forecasts INTEGER DEFAULT 0
+    )""",
 ]
 
 
@@ -175,6 +183,27 @@ class PortfolioStore:
         )
         row = await cursor.fetchone()
         return int(row[0]) if row else 0
+
+    async def record_daily_snapshot(
+        self,
+        balance_cents: int,
+        pnl_cents: int,
+        open_positions: int,
+        trades: int,
+        forecasts: int,
+    ) -> None:
+        today = datetime.date.today().isoformat()
+        await self.db.execute(
+            """INSERT INTO daily_snapshots
+               (date, balance_cents, pnl_cents, open_positions, trades, forecasts)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date) DO UPDATE SET
+                 balance_cents = ?, pnl_cents = ?, open_positions = ?,
+                 trades = ?, forecasts = ?""",
+            (today, balance_cents, pnl_cents, open_positions, trades, forecasts,
+             balance_cents, pnl_cents, open_positions, trades, forecasts),
+        )
+        await self.db.commit()
 
     async def mark_resolved(self, ticker: str, outcome: int) -> None:
         await self.db.execute(
