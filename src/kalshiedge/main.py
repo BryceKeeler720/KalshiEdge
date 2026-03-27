@@ -9,6 +9,7 @@ import structlog
 
 from kalshiedge._observe import SpanType, observe
 from kalshiedge.alerts import AlertManager
+from kalshiedge.batch_forecaster import BatchForecaster
 from kalshiedge.config import settings
 from kalshiedge.discovery import Market, check_orderbook_depth, discover_markets
 from kalshiedge.edge import compute_edge, net_edge, quarter_kelly
@@ -29,6 +30,7 @@ from kalshiedge.strategies import (
     run_near_expiry_convergence,
 )
 from kalshiedge.trader import monitor_fill, place_limit_order
+from kalshiedge.websocket import KalshiWebSocket
 
 logger = structlog.get_logger()
 
@@ -40,6 +42,8 @@ async def run_cycle(
     store: PortfolioStore,
     risk: RiskManager,
     alerts: AlertManager,
+    batch: BatchForecaster | None = None,
+    ws: KalshiWebSocket | None = None,
 ) -> None:
     """Single discovery -> forecast -> trade cycle."""
     logger.info("cycle_start")
@@ -73,6 +77,17 @@ async def run_cycle(
     except Exception:
         logger.exception("arbitrage_strategy_failed")
 
+    # Collect batch results from previous cycle (if any)
+    if batch and batch.has_pending_batch:
+        try:
+            batch_results = batch.collect_results()
+            if batch_results:
+                await _process_batch_results(
+                    kalshi, store, risk, alerts, batch_results
+                )
+        except Exception:
+            logger.exception("batch_collection_failed")
+
     # Discover markets for Strategy 1 (Calibration Edge) + Strategy 3 (Event-Driven)
     markets = await discover_markets(kalshi)
     if not markets:
@@ -102,12 +117,37 @@ async def run_cycle(
     # Skip tickers we already have open trades on
     open_trades = await store.get_open_positions()
     open_tickers = {t["ticker"] for t in open_trades}
+    selected = [m for m in selected if m.ticker not in open_tickers]
 
-    event_tickers = {m.ticker for m in event_markets}
+    # Subscribe WebSocket to selected tickers for real-time prices
+    if ws:
+        await ws.subscribe_tickers([m.ticker for m in selected])
+
+    # Gather news for all markets first
+    markets_with_news = []
     for market in selected:
-        if market.ticker in open_tickers:
-            logger.debug("skipping_existing_position", ticker=market.ticker)
-            continue
+        news = await gather_news(market.title)
+        markets_with_news.append((market, news))
+
+    # Submit batch forecast (results collected next cycle — 50% cheaper)
+    if batch and not batch.has_pending_batch and markets_with_news:
+        try:
+            batch.submit_batch([
+                {
+                    "ticker": m.ticker,
+                    "title": m.title,
+                    "price_cents": m.last_price,
+                    "close_time": m.close_time,
+                    "news_items": news,
+                }
+                for m, news in markets_with_news
+            ])
+        except Exception:
+            logger.exception("batch_submit_failed")
+
+    # Also run synchronous forecasts for immediate trading (first cycle or fallback)
+    event_tickers = {m.ticker for m in event_markets}
+    for market, news in markets_with_news:
         strategy = "event_driven" if market.ticker in event_tickers else "calibration_edge"
         try:
             await _process_market(
@@ -243,6 +283,99 @@ async def _process_market(
     asyncio.create_task(_track_fill(kalshi, store, order_id, market.ticker))
 
 
+async def _process_batch_results(
+    kalshi: KalshiClient,
+    store: PortfolioStore,
+    risk: RiskManager,
+    alerts: AlertManager,
+    results: dict[str, dict],
+) -> None:
+    """Process forecast results from a completed batch and execute trades."""
+    for ticker, forecast in results.items():
+        prob = forecast["probability"]
+        price_cents = forecast["price_cents"]
+        title = forecast["title"]
+
+        side, edge = compute_edge(prob, price_cents)
+        effective_edge = net_edge(prob, price_cents)
+
+        await store.record_forecast(
+            ticker=ticker,
+            title=title,
+            market_price_cents=price_cents,
+            model_probability=prob,
+            edge=edge,
+            confidence_low=forecast.get("confidence_low"),
+            confidence_high=forecast.get("confidence_high"),
+            reasoning=forecast.get("reasoning"),
+            strategy="batch_calibration_edge",
+        )
+
+        if side == "none" or effective_edge < settings.min_edge_threshold:
+            continue
+
+        # Get fresh price from Kalshi
+        try:
+            market_data = await kalshi.get_market(ticker)
+            m = market_data.get("market", market_data)
+            from kalshiedge.discovery import _dollars_to_cents
+
+            fresh_price = _dollars_to_cents(
+                m.get("yes_ask_dollars") or m.get("last_price_dollars")
+            )
+            if fresh_price <= 0:
+                fresh_price = price_cents
+        except Exception:
+            fresh_price = price_cents
+
+        if side == "yes":
+            price = fresh_price
+        else:
+            price = 100 - fresh_price
+
+        bankroll = await store.get_bankroll_cents() or settings.bankroll_cents
+        size_mult = await risk.size_adjustment()
+        p_side = prob if side == "yes" else (1 - prob)
+        budget = int(quarter_kelly(p_side, price, bankroll) * size_mult)
+
+        if budget <= 0 or price <= 0:
+            continue
+        count = budget // price
+        if count <= 0:
+            continue
+
+        trade = ProposedTrade(
+            ticker=ticker, side=side, action="buy",
+            price_cents=price, count=count, edge=effective_edge,
+        )
+        if not await risk.can_trade(trade):
+            continue
+
+        if settings.dry_run:
+            logger.info(
+                "batch_dry_run_signal",
+                ticker=ticker, side=side, count=count,
+                price_cents=price, edge=f"{effective_edge:.1%}",
+            )
+            continue
+
+        order = await place_limit_order(kalshi, ticker, side, count, price)
+        if order:
+            await store.record_trade(
+                ticker=ticker, side=side, action="buy",
+                price_cents=price, count=count,
+                order_id=order.get("order_id", ""),
+                strategy="batch_calibration_edge",
+            )
+            await alerts.notify_trade(
+                ticker=ticker, side=side, action="buy",
+                count=count, price_cents=price, edge=effective_edge,
+                strategy="batch_calibration_edge",
+            )
+
+    logger.info("batch_results_processed", count=len(results))
+
+
 async def _track_fill(
     kalshi: KalshiClient, store: PortfolioStore, order_id: str, ticker: str
 ) -> None:
@@ -328,6 +461,19 @@ async def main() -> None:
     risk = RiskManager(store)
     alerts = AlertManager()
 
+    # Batch forecaster for 50% cost reduction
+    batch_claude = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    batch = BatchForecaster(batch_claude)
+    logger.info("batch_forecaster_initialized")
+
+    # WebSocket for real-time data
+    ws = KalshiWebSocket()
+    try:
+        await ws.start()
+    except Exception:
+        logger.warning("websocket_start_failed")
+        ws = None
+
     shutdown_event = asyncio.Event()
 
     def _signal_handler() -> None:
@@ -341,7 +487,9 @@ async def main() -> None:
     try:
         while not shutdown_event.is_set():
             try:
-                await run_cycle(kalshi, claude, store, risk, alerts)
+                await run_cycle(
+                    kalshi, claude, store, risk, alerts, batch=batch, ws=ws
+                )
             except Exception:
                 logger.exception("cycle_failed")
                 await alerts.notify_error("Cycle failed", context="main_loop")
@@ -353,6 +501,8 @@ async def main() -> None:
             except asyncio.TimeoutError:
                 pass  # Normal — time to run next cycle
     finally:
+        if ws:
+            await ws.stop()
         await kalshi.close()
         await store.close()
         if ts:
