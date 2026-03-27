@@ -1,4 +1,4 @@
-"""Claude ensemble forecaster with extremization."""
+"""Claude forecaster — cheap Haiku screen + Sonnet ensemble on promising markets."""
 
 import datetime
 
@@ -12,6 +12,15 @@ from kalshiedge.prompts import FORECAST_USER, SUPERFORECASTER_SYSTEM, parse_fore
 from kalshiedge.research import NewsItem, format_news_context
 
 logger = structlog.get_logger()
+
+SCREEN_MODEL = "claude-haiku-4-5-20251001"
+SCREEN_MAX_TOKENS = 256
+
+SCREEN_PROMPT = (
+    "You are a quick probability screener. Given a prediction market question, "
+    "current price, and news, estimate the probability in one line.\n"
+    "Respond ONLY with: PROBABILITY: <number>%"
+)
 
 
 class ForecastResult:
@@ -30,6 +39,48 @@ class ForecastResult:
         self.raw_probabilities = raw_probabilities
 
 
+async def screen_market(
+    client: anthropic.Anthropic,
+    title: str,
+    price_cents: int,
+    close_time: str,
+    news_items: list[NewsItem],
+) -> float | None:
+    """Quick Haiku screen — returns estimated probability or None on failure.
+
+    Cost: ~$0.001 per call (vs ~$0.017 for full Sonnet ensemble).
+    """
+    news_context = format_news_context(news_items)
+    price_pct = price_cents / 100
+    prompt = (
+        f"QUESTION: {title}\n"
+        f"MARKET PRICE: {price_cents}c ({price_pct:.0%})\n"
+        f"CLOSES: {close_time}\n"
+        f"NEWS: {news_context[:500]}\n\n"
+        f"PROBABILITY: "
+    )
+    try:
+        response = client.messages.create(
+            model=SCREEN_MODEL,
+            max_tokens=SCREEN_MAX_TOKENS,
+            system=SCREEN_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text
+        parsed = parse_forecast(f"PROBABILITY: {text}")
+        if parsed["probability"] is not None:
+            logger.debug(
+                "screen_result",
+                title=title[:50],
+                prob=f"{parsed['probability']:.0%}",
+                price=price_cents,
+            )
+            return parsed["probability"]
+    except Exception:
+        logger.debug("screen_failed", title=title[:50])
+    return None
+
+
 @observe(span_type=SpanType.CHAIN)
 async def forecast_market(
     client: anthropic.Anthropic,
@@ -38,7 +89,7 @@ async def forecast_market(
     close_time: str,
     news_items: list[NewsItem],
 ) -> ForecastResult | None:
-    """Run 3 Claude calls at different temperatures, aggregate via trimmed mean + extremization."""
+    """Full Sonnet ensemble — 3 calls at different temperatures."""
     news_context = format_news_context(news_items)
     price_pct = price_cents / 100
     current_date = datetime.date.today().isoformat()

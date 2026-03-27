@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     max_concurrent_positions: int = 12
     cycle_interval_seconds: int = 600
     fast_cycle_seconds: int = 120
-    max_forecasts_per_cycle: int = 10
+    max_forecasts_per_cycle: int = 30  # Screened with cheap Haiku first
     stale_order_minutes: int = 10
 
     # Strategy tuning

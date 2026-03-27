@@ -19,7 +19,7 @@ from kalshiedge.calendar import boost_event_markets, get_upcoming_events
 from kalshiedge.config import settings
 from kalshiedge.discovery import Market, check_orderbook_depth, discover_markets
 from kalshiedge.edge import compute_edge, net_edge, quarter_kelly
-from kalshiedge.forecaster import forecast_market
+from kalshiedge.forecaster import forecast_market, screen_market
 from kalshiedge.kalshi_client import KalshiClient
 from kalshiedge.portfolio import PortfolioStore
 from kalshiedge.positions import (
@@ -190,14 +190,45 @@ async def run_slow_cycle(
     if ws:
         await ws.subscribe_tickers([m.ticker for m in selected])
 
-    # Gather news for all selected markets
-    markets_with_news = []
+    # Gather news + cheap Haiku screen on ALL selected markets
+    screened: list[tuple[Market, list, str]] = []
     for market in selected:
         news = await gather_news(market.title)
-        markets_with_news.append((market, news))
 
-    # Submit batch forecast for next cycle (50% cheaper)
-    if batch and not batch.has_pending_batch and markets_with_news:
+        # Quick Haiku screen (~$0.001) — check if there might be edge
+        screen_prob = await screen_market(
+            claude, market.title, market.last_price, market.close_time, news
+        )
+        if screen_prob is not None:
+            from kalshiedge.edge import compute_edge
+
+            side, raw_edge = compute_edge(screen_prob, market.last_price)
+            if side != "none" and raw_edge >= settings.min_edge_threshold * 0.5:
+                strategy = (
+                    "event_driven"
+                    if market.ticker in {m.ticker for m in event_markets}
+                    else "calibration_edge"
+                )
+                screened.append((market, news, strategy))
+                logger.info(
+                    "screen_passed",
+                    ticker=market.ticker,
+                    screen_prob=f"{screen_prob:.0%}",
+                    edge=f"{raw_edge:.1%}",
+                )
+            else:
+                logger.debug(
+                    "screen_no_edge", ticker=market.ticker, edge=f"{raw_edge:.1%}"
+                )
+
+    logger.info(
+        "screen_complete",
+        total=len(selected),
+        passed=len(screened),
+    )
+
+    # Submit batch forecast only for screened markets (50% cheaper)
+    if batch and not batch.has_pending_batch and screened:
         try:
             batch.submit_batch([
                 {
@@ -207,15 +238,13 @@ async def run_slow_cycle(
                     "close_time": m.close_time,
                     "news_items": news,
                 }
-                for m, news in markets_with_news
+                for m, news, _ in screened
             ])
         except Exception:
             logger.exception("batch_submit_failed")
 
-    # Run synchronous forecasts for immediate trading
-    event_tickers = {m.ticker for m in event_markets}
-    for market, _news in markets_with_news:
-        strategy = "event_driven" if market.ticker in event_tickers else "calibration_edge"
+    # Run full Sonnet ensemble only on screened markets
+    for market, _news, strategy in screened:
         try:
             await _process_market(
                 kalshi, claude, store, risk, alerts, market, strategy=strategy
