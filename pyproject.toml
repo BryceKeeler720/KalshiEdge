@@ -14,7 +14,6 @@ dependencies = [
     "pydantic-settings>=2.0",
     "python-dotenv>=1.0",
     "pygooglenews>=0.1.0",
-    "gnews>=0.3.0",
     "aiosqlite>=0.20.0",
     "python-telegram-bot>=21.0",
     "structlog>=24.0",
