@@ -93,10 +93,16 @@ async def run_cycle(
     selected = prioritized[:cap]
     logger.info("markets_selected", count=len(selected), cap=cap)
 
+    # Skip tickers we already have open trades on
+    open_trades = await store.get_open_positions()
+    open_tickers = {t["ticker"] for t in open_trades}
+
+    event_tickers = {m.ticker for m in event_markets}
     for market in selected:
-        strategy = "event_driven" if market.ticker in {
-            m.ticker for m in event_markets
-        } else "calibration_edge"
+        if market.ticker in open_tickers:
+            logger.debug("skipping_existing_position", ticker=market.ticker)
+            continue
+        strategy = "event_driven" if market.ticker in event_tickers else "calibration_edge"
         try:
             await _process_market(
                 kalshi, claude, store, risk, alerts, market, strategy=strategy
