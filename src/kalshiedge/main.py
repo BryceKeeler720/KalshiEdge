@@ -15,6 +15,12 @@ from kalshiedge.edge import compute_edge, kelly_no, net_edge, quarter_kelly
 from kalshiedge.forecaster import forecast_market
 from kalshiedge.kalshi_client import KalshiClient
 from kalshiedge.portfolio import PortfolioStore
+from kalshiedge.positions import (
+    check_settlements,
+    evaluate_exits,
+    execute_exits,
+    sync_positions,
+)
 from kalshiedge.research import gather_news
 from kalshiedge.risk import ProposedTrade, RiskManager
 from kalshiedge.trader import monitor_fill, place_limit_order
@@ -33,6 +39,18 @@ async def run_cycle(
     """Single discovery -> forecast -> trade cycle."""
     logger.info("cycle_start")
 
+    # Phase 4: Sync positions, check settlements, evaluate exits
+    try:
+        positions = await sync_positions(kalshi, store)
+        await check_settlements(kalshi, store)
+        if positions:
+            exits = await evaluate_exits(kalshi, store, positions)
+            if exits:
+                await execute_exits(kalshi, store, exits)
+    except Exception:
+        logger.exception("position_management_failed")
+
+    # Discover and forecast new opportunities
     markets = await discover_markets(kalshi)
     if not markets:
         logger.info("no_markets_found")
@@ -223,7 +241,16 @@ async def main() -> None:
     kalshi = KalshiClient()
     store = PortfolioStore()
     await store.initialize()
-    await store.set_bankroll_cents(settings.bankroll_cents)
+
+    # Sync real bankroll from Kalshi on startup
+    try:
+        bal = await kalshi.get_balance()
+        real_bankroll = bal.get("balance", 0)
+        await store.set_bankroll_cents(real_bankroll)
+        logger.info("bankroll_from_kalshi", cents=real_bankroll)
+    except Exception:
+        await store.set_bankroll_cents(settings.bankroll_cents)
+        logger.warning("using_config_bankroll")
 
     risk = RiskManager(store)
     alerts = AlertManager()

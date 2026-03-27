@@ -1,0 +1,18 @@
+[Unit]
+Description=KalshiEdge Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/KalshiEdge
+EnvironmentFile=/root/KalshiEdge/.env
+ExecStart=/root/KalshiEdge/.venv/bin/uvicorn kalshiedge.dashboard:app --host 0.0.0.0 --port 8050
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
