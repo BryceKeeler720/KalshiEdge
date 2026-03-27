@@ -60,6 +60,8 @@ async def get_live():
         "dry_run": settings.dry_run,
         "balance_cents": None,
         "balance_usd": None,
+        "positions_value_usd": None,
+        "portfolio_total_usd": None,
         "kalshi_positions": [],
         "error": None,
     }
@@ -75,16 +77,29 @@ async def get_live():
     try:
         pos = await kalshi.get_positions()
         positions = pos.get("market_positions", pos.get("positions", []))
-        result["kalshi_positions"] = [
-            {
+        pos_list = []
+        total_value_cents = 0
+        for p in positions:
+            qty = _pos_qty(p)
+            if qty <= 0:
+                continue
+            # market_exposure is in dollars as string or cents as int
+            exposure = p.get("market_exposure", 0)
+            if isinstance(exposure, str):
+                exposure_cents = int(round(float(exposure) * 100))
+            else:
+                exposure_cents = int(exposure)
+            total_value_cents += exposure_cents
+            pos_list.append({
                 "ticker": p.get("ticker", ""),
                 "side": _pos_side(p),
-                "quantity": _pos_qty(p),
-                "market_value": p.get("market_exposure", 0),
-            }
-            for p in positions
-            if _pos_qty(p) > 0
-        ]
+                "quantity": qty,
+                "market_value_usd": exposure_cents / 100,
+            })
+        result["kalshi_positions"] = pos_list
+        result["positions_value_usd"] = total_value_cents / 100
+        cash = result["balance_usd"] or 0
+        result["portfolio_total_usd"] = cash + total_value_cents / 100
     except Exception as e:
         if not result["error"]:
             result["error"] = str(e)
@@ -318,9 +333,10 @@ DASHBOARD_HTML = """\
 <div class="error-banner" id="error-banner"></div>
 
 <div class="grid" id="cards">
-  <div class="card"><div class="card-label">Kalshi Balance</div><div class="card-value" id="balance">--</div></div>
+  <div class="card"><div class="card-label">Portfolio Total</div><div class="card-value" id="portfolio-total">--</div></div>
+  <div class="card"><div class="card-label">Cash</div><div class="card-value" id="balance">--</div></div>
+  <div class="card"><div class="card-label">In Positions</div><div class="card-value" id="positions-value">--</div></div>
   <div class="card"><div class="card-label">Daily P&amp;L</div><div class="card-value" id="pnl">--</div></div>
-  <div class="card"><div class="card-label">Kalshi Positions</div><div class="card-value" id="live-positions">--</div></div>
   <div class="card"><div class="card-label">Trades Today</div><div class="card-value" id="trades-today">--</div></div>
   <div class="card"><div class="card-label">Brier Score</div><div class="card-value" id="brier">--</div></div>
   <div class="card"><div class="card-label">Total Forecasts</div><div class="card-value" id="total-forecasts">--</div></div>
@@ -336,7 +352,7 @@ DASHBOARD_HTML = """\
 <div class="section">
   <h2>Kalshi Positions (Live)</h2>
   <div class="card">
-    <table><thead><tr><th>Ticker</th><th>Side</th><th>Quantity</th></tr></thead>
+    <table><thead><tr><th>Ticker</th><th>Side</th><th>Qty</th><th>Value</th></tr></thead>
     <tbody id="kalshi-positions-table"></tbody></table>
   </div>
 </div>
@@ -412,11 +428,16 @@ async function refresh() {
     const balUsd = live.balance_usd != null ? live.balance_usd : d.bankroll_usd;
     document.getElementById('balance').textContent = '$' + balUsd.toFixed(2);
 
+    const posVal = live.positions_value_usd != null ? live.positions_value_usd : 0;
+    document.getElementById('positions-value').textContent = '$' + posVal.toFixed(2);
+
+    const totalVal = live.portfolio_total_usd != null ? live.portfolio_total_usd : balUsd;
+    document.getElementById('portfolio-total').textContent = '$' + totalVal.toFixed(2);
+
     const pnlEl = document.getElementById('pnl');
     pnlEl.textContent = fmt$(d.daily_pnl_cents);
     pnlEl.className = 'card-value ' + (d.daily_pnl_cents > 0 ? 'positive' : d.daily_pnl_cents < 0 ? 'negative' : '');
 
-    document.getElementById('live-positions').textContent = live.kalshi_positions.length;
     document.getElementById('trades-today').textContent = d.trades_today;
     document.getElementById('brier').textContent = d.brier_score != null ? d.brier_score.toFixed(4) : 'N/A';
     document.getElementById('total-forecasts').textContent = d.total_forecasts + (d.total_resolved > 0 ? ` (${d.total_resolved} resolved)` : '');
@@ -425,12 +446,13 @@ async function refresh() {
     // Kalshi live positions
     const kpt = document.getElementById('kalshi-positions-table');
     if (live.kalshi_positions.length === 0) {
-      kpt.innerHTML = '<tr><td colspan="3" class="empty">No open positions on Kalshi</td></tr>';
+      kpt.innerHTML = '<tr><td colspan="4" class="empty">No open positions on Kalshi</td></tr>';
     } else {
       kpt.innerHTML = live.kalshi_positions.map(p => `<tr>
         <td>${p.ticker}</td>
         <td>${badge(p.side.toUpperCase(), p.side)}</td>
         <td>${p.quantity}</td>
+        <td>$${(p.market_value_usd || 0).toFixed(2)}</td>
       </tr>`).join('');
     }
 
