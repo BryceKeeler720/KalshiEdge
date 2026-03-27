@@ -2,7 +2,10 @@
 
 import time
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
+import feedparser
+import httpx
 import structlog
 
 from kalshiedge._observe import SpanType, observe
@@ -10,6 +13,7 @@ from kalshiedge._observe import SpanType, observe
 logger = structlog.get_logger()
 
 CACHE_TTL_SECONDS = 1800  # 30 minutes
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
 
 @dataclass
@@ -31,14 +35,14 @@ _cache: dict[str, _CacheEntry] = {}
 
 @observe(span_type=SpanType.RETRIEVAL)
 async def gather_news(query: str) -> list[NewsItem]:
-    """Gather news for a market title. Tries pygooglenews, falls back to GDELT."""
+    """Gather news via Google News RSS, fall back to GDELT."""
     cache_key = query.lower().strip()
     cached = _cache.get(cache_key)
     if cached and (time.time() - cached.timestamp) < CACHE_TTL_SECONDS:
         logger.debug("news_cache_hit", query=query)
         return cached.items
 
-    items = await _try_googlenews(query)
+    items = await _try_google_rss(query)
     if not items:
         items = await _try_gdelt(query)
 
@@ -47,13 +51,16 @@ async def gather_news(query: str) -> list[NewsItem]:
     return items
 
 
-async def _try_googlenews(query: str) -> list[NewsItem]:
+async def _try_google_rss(query: str) -> list[NewsItem]:
+    """Fetch Google News RSS directly with feedparser."""
     try:
-        from pygooglenews import GoogleNews
+        url = GOOGLE_NEWS_RSS.format(query=quote(query))
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
 
-        gn = GoogleNews(lang="en", country="US")
-        results = gn.search(query, when="7d")
-        entries = results.get("entries", [])[:5]
+        feed = feedparser.parse(resp.text)
+        entries = feed.get("entries", [])[:5]
         return [
             NewsItem(
                 title=e.get("title", ""),
@@ -63,28 +70,34 @@ async def _try_googlenews(query: str) -> list[NewsItem]:
             for e in entries
         ]
     except Exception:
-        logger.debug("googlenews_failed", query=query)
+        logger.debug("google_rss_failed", query=query)
         return []
 
 
 async def _try_gdelt(query: str) -> list[NewsItem]:
+    """Fall back to GDELT API for news."""
     try:
-        from gdeltdoc import Filters, GdeltDoc
+        url = "https://api.gdeltproject.org/api/v2/doc/doc"
+        params = {
+            "query": query,
+            "mode": "ArtList",
+            "maxrecords": "5",
+            "format": "json",
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
 
-        gd = GdeltDoc()
-        f = Filters(keyword=query, timespan="7d")
-        articles = gd.article_search(f)
-        if articles.empty:
-            return []
-        records = articles.head(5).to_dict("records")
+        articles = data.get("articles", [])
         return [
             NewsItem(
-                title=r.get("title", ""),
-                source=r.get("domain", ""),
-                published=r.get("seendate", ""),
-                description=r.get("title", ""),
+                title=a.get("title", ""),
+                source=a.get("domain", ""),
+                published=a.get("seendate", ""),
+                description=a.get("title", ""),
             )
-            for r in records
+            for a in articles[:5]
         ]
     except Exception:
         logger.debug("gdelt_failed", query=query)
