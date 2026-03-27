@@ -58,8 +58,8 @@ class TestParseMarket:
 class TestPassesFilters:
     def _market(self, **kwargs) -> Market:
         defaults = {
-            "ticker": "TEST", "title": "Test", "yes_bid": 40, "yes_ask": 45,
-            "no_bid": 55, "no_ask": 60, "last_price": 42, "volume": 1000,
+            "ticker": "TEST", "title": "Test", "yes_bid": 20, "yes_ask": 25,
+            "no_bid": 75, "no_ask": 80, "last_price": 22, "volume": 1000,
             "volume_24h": 200, "open_interest": 500,
             "close_time": "2026-05-01T00:00:00Z",  # ~30 days out
         }

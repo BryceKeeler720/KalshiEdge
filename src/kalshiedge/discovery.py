@@ -192,6 +192,10 @@ def _passes_filters(market: Market) -> bool:
     if market.last_price <= 2 or market.last_price >= 98:
         return False
 
+    # Skip well-calibrated middle range — no edge per empirical data
+    if 40 <= market.last_price <= 60:
+        return False
+
     # Must have some bid/ask (not completely empty book)
     if market.yes_bid <= 0 and market.yes_ask <= 0:
         return False
