@@ -227,7 +227,7 @@ async def run_intra_event_arbitrage(
         if abs(deviation) > ARB_THRESHOLD:
             logger.info(
                 "arb_opportunity",
-                event=event_ticker,
+                event_ticker=event_ticker,
                 total_prob=f"{total_prob:.1%}",
                 deviation=f"{deviation:+.1%}",
                 markets=len(market_prices),
