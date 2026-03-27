@@ -35,15 +35,18 @@ async def sync_positions(kalshi: KalshiClient, store: PortfolioStore) -> list[di
         positions = pos_data.get("market_positions", pos_data.get("positions", []))
         live = []
         for p in positions:
-            yes_qty = _safe_int(p.get("yes_contracts", 0))
-            no_qty = _safe_int(p.get("no_contracts", 0))
-            if yes_qty > 0 or no_qty > 0:
-                live.append({
-                    "ticker": p.get("ticker", ""),
-                    "yes_contracts": yes_qty,
-                    "no_contracts": no_qty,
-                    "market_exposure": p.get("market_exposure", 0),
-                })
+            # position_fp: positive = YES contracts, negative = NO contracts
+            pos_fp = float(p.get("position_fp", 0) or 0)
+            if pos_fp == 0:
+                continue
+            yes_qty = int(pos_fp) if pos_fp > 0 else 0
+            no_qty = abs(int(pos_fp)) if pos_fp < 0 else 0
+            live.append({
+                "ticker": p.get("ticker", ""),
+                "yes_contracts": yes_qty,
+                "no_contracts": no_qty,
+                "market_exposure": p.get("market_exposure_dollars", 0),
+            })
         logger.info("positions_synced", count=len(live))
         return live
     except Exception:

@@ -83,8 +83,8 @@ async def get_live():
             qty = _pos_qty(p)
             if qty <= 0:
                 continue
-            # market_exposure is in dollars as string or cents as int
-            exposure = p.get("market_exposure", 0)
+            # market_exposure_dollars is a dollar string like "5.000000"
+            exposure = p.get("market_exposure_dollars", p.get("market_exposure", 0))
             if isinstance(exposure, str):
                 exposure_cents = int(round(float(exposure) * 100))
             else:
@@ -109,20 +109,19 @@ async def get_live():
 
 
 def _pos_side(p: dict) -> str:
-    yes = p.get("yes_contracts", p.get("total_traded", 0))
-    no = p.get("no_contracts", 0)
-    if isinstance(yes, (int, float)) and yes > 0:
-        return "yes"
-    if isinstance(no, (int, float)) and no > 0:
-        return "no"
-    return "yes"
+    # position_fp: positive = YES, negative = NO
+    pos = p.get("position_fp", p.get("yes_contracts", 0))
+    try:
+        val = float(pos) if pos else 0
+    except (ValueError, TypeError):
+        val = 0
+    return "no" if val < 0 else "yes"
 
 
 def _pos_qty(p: dict) -> int:
-    yes = p.get("yes_contracts", 0)
-    no = p.get("no_contracts", 0)
+    pos = p.get("position_fp", p.get("yes_contracts", 0))
     try:
-        return max(int(yes or 0), int(no or 0))
+        return abs(int(float(pos))) if pos else 0
     except (ValueError, TypeError):
         return 0
 
