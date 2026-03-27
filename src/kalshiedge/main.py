@@ -21,6 +21,7 @@ from kalshiedge.discovery import Market, check_orderbook_depth, discover_markets
 from kalshiedge.edge import compute_edge, net_edge, quarter_kelly
 from kalshiedge.forecaster import forecast_market, screen_market
 from kalshiedge.kalshi_client import KalshiClient
+from kalshiedge.momentum import run_momentum_scan
 from kalshiedge.portfolio import PortfolioStore
 from kalshiedge.positions import (
     check_settlements,
@@ -85,6 +86,12 @@ async def run_fast_cycle(
         await run_intra_event_arbitrage(kalshi, store, risk)
     except Exception:
         logger.exception("arbitrage_strategy_failed")
+
+    # Strategy 5: Momentum — catch price/volume spikes (no Claude calls)
+    try:
+        await run_momentum_scan(kalshi, store, risk)
+    except Exception:
+        logger.exception("momentum_strategy_failed")
 
     logger.info("fast_cycle_complete")
 
