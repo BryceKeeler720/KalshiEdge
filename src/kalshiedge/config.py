@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     max_sonnet_per_cycle: int = 10  # Expensive full forecasts after screening
     stale_order_minutes: int = 10
 
+    # Quant engine (pure math, zero Claude cost)
+    quant_enabled: bool = True
+    quant_cycle_seconds: int = 45  # Run quant every 45 seconds
+    quant_min_edge: float = 0.03  # 3% edge threshold
+    quant_position_pct: float = 0.02  # 2% of bankroll per trade
+    quant_max_trades_per_cycle: int = 5
+
     # Strategy tuning
     convergence_min_price: int = 93
     convergence_max_price: int = 97

@@ -23,6 +23,7 @@ from kalshiedge.edge import compute_edge, net_edge, quarter_kelly, r_score
 from kalshiedge.forecaster import screen_market
 from kalshiedge.kalshi_client import KalshiClient
 from kalshiedge.momentum import run_momentum_scan
+from kalshiedge.quant import run_quant_cycle
 from kalshiedge.portfolio import PortfolioStore
 from kalshiedge.positions import (
     check_settlements,
@@ -636,6 +637,15 @@ async def main() -> None:
     if settings.dry_run:
         logger.info("dry_run_mode — forecasts only, no orders will be placed")
 
+    if settings.quant_enabled:
+        logger.info(
+            "quant_engine_enabled",
+            cycle_seconds=settings.quant_cycle_seconds,
+            min_edge=settings.quant_min_edge,
+            position_pct=settings.quant_position_pct,
+            max_trades_per_cycle=settings.quant_max_trades_per_cycle,
+        )
+
     # Initialize 2signal if configured
     ts = None
     try:
@@ -699,8 +709,9 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _signal_handler)
 
-    # Track when slow cycle last ran
+    # Track when cycles last ran
     last_slow_cycle = 0.0
+    last_quant_cycle = 0.0
     last_summary_date = ""
     breaker = CircuitBreaker()
 
@@ -713,6 +724,14 @@ async def main() -> None:
                 await run_fast_cycle(kalshi, store, risk, alerts, ws=ws)
             except Exception:
                 logger.exception("fast_cycle_failed")
+
+            # Run quant cycle (pure math, zero Claude cost, high frequency)
+            if settings.quant_enabled and (now - last_quant_cycle) >= settings.quant_cycle_seconds:
+                try:
+                    await run_quant_cycle(kalshi, store, risk)
+                except Exception:
+                    logger.exception("quant_cycle_failed")
+                last_quant_cycle = now
 
             # Run slow cycle if enough time has passed (and circuit breaker allows)
             if (now - last_slow_cycle) >= settings.cycle_interval_seconds:
